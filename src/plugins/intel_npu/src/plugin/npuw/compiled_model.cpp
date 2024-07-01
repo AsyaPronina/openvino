@@ -656,76 +656,83 @@ void ov::npuw::CompiledModel::implement_properties() {
     // that can be used later to return requested properties by user.
     // It does it in 3 steps:
     //
-    // 1. Create mappings for all coped from HETERO plugin properties.
-    // 2. Fill `m_all_supported_props` with properties from 1st step.
+    // 1. Create mappings for OV public properties and hints, exposed
+    //    in ::intel_npu::CompiledModel.
+    // 2. Fill `m_all_supported_props` with properties from the 1st step.
     // 3. Create mappings for all NPUW-specific properties to getters of their
     //    values from config.
 
+#define GET_PUBLIC_PROP(property) return get_plugin()->get_property(property.name(), ov::AnyMap());
+
     // 1.
-    m_prop_to_opt = {
-        {ov::supported_properties.name(),
-         {ov::PropertyMutability::RO,
-          [&](const ::intel_npu::Config&) {
-              return m_all_supported_props;
-          }}},
-        {ov::device::properties.name(),
-         {ov::PropertyMutability::RO,
-          [&](const ::intel_npu::Config&) {
-              ov::AnyMap all_devices = {};
-              for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {
-                  auto comp_model_desc = m_compiled_submodels[i];
-                  if (!comp_model_desc.compiled_model)  // Handle if optimized out
-                      continue;
-                  ov::AnyMap device_properties = {};
-                  if (all_devices.count(submodel_device(i)) == 0) {
-                      auto device_supported_props =
-                          comp_model_desc.compiled_model->get_property(ov::supported_properties.name());
-                      for (auto&& property_name : device_supported_props.as<std::vector<ov::PropertyName>>())
-                          device_properties[property_name] =
-                              comp_model_desc.compiled_model->get_property(property_name);
-                      all_devices[submodel_device(i)] = device_properties;
-                  }
-              }
-              return all_devices;
-          }}},
-        {ov::model_name.name(),
-         {ov::PropertyMutability::RO,
-          [&](const ::intel_npu::Config&) {
-              return m_name;
-          }}},
-        {ov::optimal_number_of_infer_requests.name(),
-         {ov::PropertyMutability::RO,
-          [&](const ::intel_npu::Config&) {
-              unsigned int value = 0u;
-              for (const auto& comp_model_desc : m_compiled_submodels) {
-                  if (comp_model_desc.compiled_model) {  // Some models may be optimized out
-                      value = std::max(
-                          value,
-                          comp_model_desc.compiled_model->get_property(ov::optimal_number_of_infer_requests.name())
-                              .as<unsigned int>());
-                  }
-              }
-              return value;
-          }}},
-        {ov::execution_devices.name(),
-         {ov::PropertyMutability::RO,
-          [&](const ::intel_npu::Config&) {
-              std::vector<std::string> device_names;
-              std::set<std::string> s;
-              for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {
-                  const auto& comp_model_desc = m_compiled_submodels[i];
-                  if (!comp_model_desc.compiled_model)  // handle optimized out
-                      continue;
-                  if (s.count(submodel_device(i)) != 0)
-                      continue;
-                  s.insert(submodel_device(i));
-                  device_names.push_back(submodel_device(i));
-              }
-              return decltype(ov::execution_devices)::value_type{device_names};
-          }}},
-        {ov::loaded_from_cache.name(), {ov::PropertyMutability::RO, [&](const ::intel_npu::Config&) {
-                                            return m_loaded_from_cache;
-                                        }}}};
+    // OV Public
+    // =========
+    m_prop_to_opt = {{ov::supported_properties.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           return m_all_supported_props;
+                       }}},
+                     {ov::device::id.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::device::id);
+                       }}},
+                     {ov::enable_profiling.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::enable_profiling);
+                       }}},
+                     {ov::model_name.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           return m_name;
+                       }}},
+                     {ov::optimal_number_of_infer_requests.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           return 1u;
+                       }}},
+                     {ov::execution_devices.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           return "NPU";
+                       }}},
+                     {ov::loaded_from_cache.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           return m_loaded_from_cache;
+                       }}},
+                     // OV Public Hints
+                     // =========
+                     {ov::hint::performance_mode.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::hint::performance_mode);
+                       }}},
+                     {ov::hint::execution_mode.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::hint::execution_mode);
+                       }}},
+                     {ov::hint::num_requests.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::hint::num_requests);
+                       }}},
+                     {ov::hint::inference_precision.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::hint::inference_precision);
+                       }}},
+                     {ov::hint::enable_cpu_pinning.name(),
+                      {ov::PropertyMutability::RO,
+                       [&](const ::intel_npu::Config&) {
+                           GET_PUBLIC_PROP(ov::hint::enable_cpu_pinning);
+                       }}},
+                     {ov::hint::model_priority.name(), {ov::PropertyMutability::RO, [&](const ::intel_npu::Config&) {
+                                                            GET_PUBLIC_PROP(ov::hint::model_priority);
+                                                        }}}};
+#undef GET_PUBLIC_PROP
 
     // 2.
     for (auto& p : m_prop_to_opt) {
@@ -769,77 +776,4 @@ void ov::npuw::CompiledModel::implement_properties() {
 #endif
     });
 #undef BIND
-<<<<<<< HEAD
-    // 2.
-    m_prop_to_opt.insert(
-        {{ov::supported_properties.name(),
-          {ov::PropertyMutability::RO,
-           [&](const ::intel_npu::Config&) -> const std::vector<ov::PropertyName, std::allocator<ov::PropertyName>>& {
-               return m_all_supported_props;
-           }}},
-         {ov::device::properties.name(),
-          {ov::PropertyMutability::RO,
-           [&](const ::intel_npu::Config&) {
-               ov::AnyMap all_devices = {};
-               for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {
-                   const auto& comp_model_desc = m_compiled_submodels[i];
-                   if (!comp_model_desc.compiled_model)  // Handle if optimized out
-                       continue;
-                   ov::AnyMap device_properties = {};
-                   if (all_devices.count(submodel_device(i)) == 0) {
-                       auto device_supported_props =
-                           comp_model_desc.compiled_model->get_property(ov::supported_properties.name());
-                       for (auto&& property_name : device_supported_props.as<std::vector<ov::PropertyName>>())
-                           device_properties[property_name] =
-                               comp_model_desc.compiled_model->get_property(property_name);
-                       all_devices[submodel_device(i)] = device_properties;
-                   }
-               }
-               return all_devices;
-           }}},
-         {ov::model_name.name(),
-          {ov::PropertyMutability::RO,
-           [&](const ::intel_npu::Config&) -> const std::string& {
-               return m_name;
-           }}},
-         {ov::optimal_number_of_infer_requests.name(),
-          {ov::PropertyMutability::RO,
-           [&](const ::intel_npu::Config&) {
-               unsigned int value = 0u;
-               for (const auto& comp_model_desc : m_compiled_submodels) {
-                   if (comp_model_desc.compiled_model) {  // Some models may be optimized out
-                       value = std::max(
-                           value,
-                           comp_model_desc.compiled_model->get_property(ov::optimal_number_of_infer_requests.name())
-                               .as<unsigned int>());
-                   }
-               }
-               return value;
-           }}},
-         {ov::execution_devices.name(),
-          {ov::PropertyMutability::RO,
-           [&](const ::intel_npu::Config&) {
-               std::vector<std::string> device_names;
-               std::set<std::string> s;
-               for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {
-                   const auto& comp_model_desc = m_compiled_submodels[i];
-                   if (!comp_model_desc.compiled_model)  // handle optimized out
-                       continue;
-                   if (s.count(submodel_device(i)) != 0)
-                       continue;
-                   s.insert(submodel_device(i));
-                   device_names.push_back(submodel_device(i));
-               }
-               return decltype(ov::execution_devices)::value_type{std::move(device_names)};
-           }}},
-         {ov::loaded_from_cache.name(), {ov::PropertyMutability::RO, [&](const ::intel_npu::Config&) {
-                                             return m_loaded_from_cache;
-                                         }}}});
-
-    // 3.
-    for (auto& p : m_prop_to_opt) {
-        m_all_supported_props.emplace_back(ov::PropertyName(p.first, std::get<0>(p.second)));
-    }
-=======
->>>>>>> 810d780815 (Properties for npuw::CompiledModel are split to private and public)
 }
