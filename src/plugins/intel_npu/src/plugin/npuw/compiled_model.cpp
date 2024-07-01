@@ -629,17 +629,47 @@ void ov::npuw::CompiledModel::implement_properties() {
     // that can be used later to return requested properties by user.
     // It does it in 3 steps:
     //
-    // 1. Create mappings for all coped from HETERO plugin properties.
+    // 1. Create mappings for all coped from HETERO plugin properties +
+    //    OV public properties and hints as in ::intel_npu::CompiledModel.
     // 2. Fill `m_all_supported_props` with properties from 1st step.
     // 3. Create mappings for all NPUW-specific properties to getters of their
     //    values from config.
 
+#define GET_PUBLIC_PROP(property)                                                                     \
+    int npu_submodel_idx = -1;                                                                        \
+    int device_submodel_idx = -1;                                                                     \
+    for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {                                        \
+        auto comp_model_desc = m_compiled_submodels[i];                                               \
+        if (!comp_model_desc.compiled_model)                                                          \
+            continue;                                                                                 \
+        device_submodel_idx = i;                                                                      \
+        if (submodel_device(i) == "NPU") {                                                            \
+            npu_submodel_idx = i;                                                                     \
+            break;                                                                                    \
+        }                                                                                             \
+    }                                                                                                 \
+    return npu_submodel_idx > -1                                                                      \
+               ? m_compiled_submodels[npu_submodel_idx].compiled_model->get_property(property.name()) \
+               : m_compiled_submodels[device_submodel_idx].compiled_model->get_property(property.name());
+
     // 1.
+    // OV Public
+    // =========
     m_prop_to_opt = {
         {ov::supported_properties.name(),
          {ov::PropertyMutability::RO,
           [&](const ::intel_npu::Config&) {
               return m_all_supported_props;
+          }}},
+        {ov::device::id.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::device::id);
+          }}},
+        {ov::enable_profiling.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::enable_profiling);
           }}},
         {ov::device::properties.name(),
          {ov::PropertyMutability::RO,
@@ -667,6 +697,7 @@ void ov::npuw::CompiledModel::implement_properties() {
               return m_name;
           }}},
         {ov::optimal_number_of_infer_requests.name(),
+         // Fix to take max from Npu and then from other devices
          {ov::PropertyMutability::RO,
           [&](const ::intel_npu::Config&) {
               unsigned int value = 0u;
@@ -698,7 +729,51 @@ void ov::npuw::CompiledModel::implement_properties() {
           }}},
         {ov::loaded_from_cache.name(), {ov::PropertyMutability::RO, [&](const ::intel_npu::Config&) {
                                             return m_loaded_from_cache;
-                                        }}}};
+                                        }}},
+        // OV Public Hints
+        // =========
+        {ov::hint::performance_mode.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::hint::performance_mode);
+          }}},
+        {ov::hint::execution_mode.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::hint::execution_mode);
+          }}},
+        {ov::hint::num_requests.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::hint::num_requests);
+          }}},
+        {ov::hint::inference_precision.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::hint::inference_precision);
+          }}},
+        {ov::hint::enable_cpu_pinning.name(),
+         {ov::PropertyMutability::RO,
+          [&](const ::intel_npu::Config& config) {
+              GET_PUBLIC_PROP(ov::hint::enable_cpu_pinning);
+          }}},
+        {ov::hint::model_priority.name(),
+         {ov::PropertyMutability::RO, [&](const ::intel_npu::Config& config) {
+              int npu_submodel_idx = -1;
+              for (size_t i = 0; i < m_compiled_submodels.size(); ++i) {
+                  auto comp_model_desc = m_compiled_submodels[i];
+                  if (!comp_model_desc.compiled_model)
+                      continue;
+                  if (submodel_device(i) == "NPU") {
+                      npu_submodel_idx = i;
+                      break;
+                  }
+              }
+              return npu_submodel_idx > -1 ? m_compiled_submodels[npu_submodel_idx].compiled_model->get_property(
+                                                 ov::hint::model_priority.name())
+                                           : ov::hint::Priority::DEFAULT;
+          }}}};
+#undef GET_PUBLIC_PROP
 
     // 2.
     for (auto& p : m_prop_to_opt) {
