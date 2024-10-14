@@ -20,6 +20,24 @@
 #include "util.hpp"
 #include "weights_bank.hpp"
 
+#include <openvino/opsets/opset11.hpp>
+
+std::shared_ptr<ov::Model> get_model_with_one_op(std::shared_ptr<ov::opset11::Parameter> param) {
+    auto param_copy = std::make_shared<ov::opset11::Parameter>(param->get_element_type(), param->get_shape());
+    param_copy->set_friendly_name("input");
+    // ov::Shape const_shape = param_copy->get_shape();
+    // for (int i = 0; i < const_shape.size(); ++i) {
+    //     const_shape[i] = 1;
+    // }
+    auto const_value = ov::opset11::Constant::create(param_copy->get_element_type(), ov::Shape({1, 1}), {1});
+    const_value->set_friendly_name("const_val");
+    auto multiply = std::make_shared<ov::opset11::Multiply>(param_copy, const_value, ov::op::AutoBroadcastSpec(ov::op::AutoBroadcastType::NUMPY));
+    multiply->set_friendly_name("multiply");
+    auto result = std::make_shared<ov::opset11::Result>(multiply);
+    result->set_friendly_name("res");
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{param_copy});
+}
+
 ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : IBaseInferRequest(compiled_model) {
     m_use_function_pipelining = m_npuw_model->m_cfg.get<::intel_npu::NPUW_FUNCALL_ASYNC>();

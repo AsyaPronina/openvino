@@ -1092,6 +1092,12 @@ VecMemoryDescs Graph::getOutputMemoryDescriptors() const {
 
 void Graph::InferStatic(SyncInferRequest* request, int numaId) {
     for (const auto& node : m_executableGraphNodes) {
+        std::cout << "executing : " << node->getName() << std::endl;
+        auto input_edges = node->getParentEdges();
+        for (auto i = 0; i < input_edges.size(); ++i) {
+            auto edge = node->getParentEdgeAt(i);
+            std::cout << "    input   : " << edge->getParent()->getName() << std::endl;
+        }
         ExecuteNodeWithCatch(node, request, numaId);
     }
 }

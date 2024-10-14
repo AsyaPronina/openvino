@@ -439,6 +439,8 @@ void Partitioner::identifySubgraphs() {
                     // Input to this subgraph layer is already a Parameter (original graph
                     // input). Track it among the subgraph parameters and continue.
                     parameter_as_is(input_node);
+                    std::cout << "Number of outputs: " << input_node->output(0).get_target_inputs().size() << std::endl;
+                    std::cout << "For real, output: " << input_node->output(0).get_target_inputs().begin()->get_node() << std::endl;
                 } else if (ov::op::util::is_constant(input_node)) {
                     // Input to this subgraph layer is Const (weight). Don't do anything here.
                     continue;
@@ -457,9 +459,26 @@ void Partitioner::identifySubgraphs() {
                     //  - which reads from a Parameter
                     // This happens when an offline plan is used with a kvcache
                     // model extended with slices to maintain zero-copy (LLM case)
+                    //
+                    // However it might the case, that Convert has muiltiple readers and if it is
+                    // connected to Parameter, then it is certainly an input layer somewhere else.
+                    // Can create another convert
+                    std::cout << "Number of outputs: " << input_node->output(0).get_target_inputs().size() << std::endl;
+                    std::cout << "Output: " << *input_node->output(0).get_target_inputs().begin()->get_node() << std::endl;
+                    if (ov::is_type<ov::op::v0::Convert>(input_node) && input_node->output(0).get_target_inputs().size() > 1) {
+                        std::cout << input_node->outputs().size() << std::endl;
+                        // ov::Node to Output<Node> which some layers don't support by default.
+                        auto new_param = parameter_from(input_desc.get_source_output());
+                        ov::copy_runtime_info(input_node, new_param);
+                        input_desc.replace_source_output(new_param);
+                        LOG_DEBUG("Added usually: " << new_param);
+                        continue;
+                    }
+
                     auto extra_param = input_node->input(0).get_source_output().get_node_shared_ptr();
                     input_mapping[input_node] = extra_param;
                     extra_params.insert(extra_param);
+                    LOG_DEBUG("Added extra param " << extra_param);
                 } else {
                     // Ok, this input is connected to some other node's output
                     // Replace this connection with a link to a newly created Parameter
@@ -481,6 +500,7 @@ void Partitioner::identifySubgraphs() {
                         auto new_param = parameter_from(input_desc.get_source_output());
                         ov::copy_runtime_info(input_node, new_param);
                         input_desc.replace_source_output(new_param);
+                        LOG_DEBUG("Added " << new_param);
                     }
                 }  // if (is..)
             }      // for (inputs)
@@ -612,6 +632,7 @@ void Partitioner::identifySubgraphs() {
                     group.sg._results.push_back(std::dynamic_pointer_cast<ov::op::v0::Result>(maybe_result));
                     result_cache[output_layer_ptr] =
                         LinkPtrFrom{this_group_idx, std::dynamic_pointer_cast<ov::op::v0::Result>(maybe_result)};
+                    std::cout << "Added result as global " << maybe_result << std::endl;
                 } else if (has_external_readers) {
                     // Introduce and record a new Result
                     // As the graph is processed in the topological order,
@@ -632,6 +653,7 @@ void Partitioner::identifySubgraphs() {
 
                         ov::copy_runtime_info(output_desc.get_node_shared_ptr(), new_result);
                         group.sg._results.push_back(new_result);
+                        std::cout << "Added result as external " << new_result << std::endl;
                     }
                 }
             }  // for (outputs)
@@ -718,6 +740,8 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
                     LOG_DEBUG(this_layer_name << " is a prototype of " << layer);
                     layer_to_prototype[layer] = this_layer_name;  // Link to self is ok
                 }
+            } else {
+                LOG_DEBUG(this_layer_name << " is not prototype of anything!!");
             }
         }
     }
@@ -1468,6 +1492,7 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
         }
         const auto& this_layer_name = node_ptr->get_friendly_name();
         LOG_DEBUG("Processing " << this_layer_name);
+        LOG_BLOCK();
 
         for (auto&& input_desc : node_ptr->inputs()) {
             const auto& prod_output = input_desc.get_source_output();
@@ -1483,14 +1508,30 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
                 auto new_param = std::make_shared<ov::op::v0::Parameter>(prod_output.get_element_type(),
                                                                          prod_output.get_partial_shape());
                 input_desc.replace_source_output(new_param);  // (n)/1/i/a
-                function._model->add_parameters({std::move(new_param)});
-                LOG_DEBUG("Register Parameter[" << new_param_idx << "] as input to " << iport.first << " / "
+                LOG_DEBUG("Register Parameter[" << new_param->get_friendly_name() << "] as input to " << iport.first << " / "
                                                 << iport.second);
+                function._model->add_parameters({new_param});
+                // map issue?
                 function._param_mapping[iport] = new_param_idx;  // (n)/1/i/b
                 new_param_idx++;
 
                 LOG_DEBUG("Register " << prod_output << " in the function closure");
                 funcall._closure.push_back(ov::npuw::util::tensor_from_const(input_node));  // (n)/1/i/c
+                const auto bin_path = std::string("closure_") + std::to_string(funcall._closure.size()) + ".bin";
+                std::ofstream bin_file(bin_path, std::ios_base::out | std::ios_base::binary);
+                bin_file.write(static_cast<const char*>(std::dynamic_pointer_cast<ov::op::v0::Constant>(input_node)->get_data_ptr()),
+                               static_cast<std::streamsize>(std::dynamic_pointer_cast<ov::op::v0::Constant>(input_node)->get_byte_size()));
+                const auto param_bin_path = std::string("param_closure_") + std::to_string(funcall._closure.size()) + ".bin";
+                std::ofstream param_bin_file(param_bin_path, std::ios_base::out | std::ios_base::binary);
+                param_bin_file.write(static_cast<const char*>(funcall._closure[funcall._closure.size() - 1].data()),
+                                     static_cast<std::streamsize>(funcall._closure[funcall._closure.size() - 1].get_byte_size()));
+                LOG_INFO("Wrote file " << bin_path << "...");
+
+                const auto meta_path = std::string("closure_") + std::to_string(funcall._closure.size()) + ".txt";
+                std::ofstream meta_file(meta_path);
+                meta_file << std::dynamic_pointer_cast<ov::op::v0::Constant>(input_node)->get_element_type() << ' '
+                          << std::dynamic_pointer_cast<ov::op::v0::Constant>(input_node)->get_shape() << std::endl;
+                LOG_INFO("Wrote file " << meta_path << "...");
             } else if (ov::op::util::is_parameter(input_node)) {
                 LOG_DEBUG("Handling a Parameter input " << prod_output);
                 LOG_BLOCK();

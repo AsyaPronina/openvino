@@ -44,6 +44,7 @@ ov::Tensor ov::npuw::util::tensor_from_const(const std::shared_ptr<ov::Node>& no
     NPUW_ASSERT(node->outputs().size() == 1);
     const auto port = node->output(0);
     auto cnst_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(node);
+    std::cout << "port shape: " << port.get_shape() << std::endl;
     return ov::Tensor(port.get_element_type(), port.get_shape(), const_cast<void*>(cnst_node->get_data_ptr()));
 }
 
