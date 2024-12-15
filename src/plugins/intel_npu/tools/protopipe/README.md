@@ -262,7 +262,7 @@ Every stream has the following execution parameters:
 - `frames_interval_in_ms` - **Optional**. Execution frequency of the stream (**Default**: 0 - Unbounded)  
 - `target_fps` - **Optional**. Execution frequency of the stream. `target_fps = 1000 / frames_interval_in_ms`. `target_fps` and `frames_interval_in_ms` are mutually exclusive and cannot be provided together.
 - `target_latency_in_ms` - **Optional**. When iteration isn't finished within specified interval, the next frame will be dropped from execution. (**Default**: Disabled)
-- `op_desc`/`conections` or `network` - **Required**. Execution graph structure. Follow [Graph structure](#graph-structure) for the details.
+- `op_desc`/`connections` or `network` - **Required**. Execution graph structure. Follow [Graph structure](#graph-structure) for the details.
 
 ### Config example
 Consider the following scenario that consists of two parallel streams specified on `config.yaml`:  
