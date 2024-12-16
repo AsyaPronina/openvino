@@ -966,7 +966,7 @@ std::vector<ScenarioDesc> parseScenarios(const YAML::Node& node, const GlobalOpt
     std::vector<ScenarioDesc> scenarios;
     for (const auto& subnode : node) {
         const std::unordered_set<std::string> parameters = {"name", "input_stream_list"};
-        validateNodeKeys("Scenario", subnode, parameters);
+        validateNodeKeys("Scenario", subnode, parameters, true);
 
         ScenarioDesc scenario;
         scenario.name = subnode["name"] ? subnode["name"].as<std::string>()
