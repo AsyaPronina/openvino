@@ -139,31 +139,66 @@ namespace {
 
 namespace {
     void validateNodeKeys(const std::string& parser_name, const YAML::Node& node,
-                          const std::unordered_set<std::string>& supported_keys)
+                          const std::unordered_set<std::string>& supported_keys,
+                          bool leaf_call = false)
     {
-        // Since YAML config is parsed in-depth and parsing is sequential, we can assume that
-        // one YAML layer (map, sequence, ...) is parsed multiple times but in order.
-        static YAML::Node previous_layer;
-        static std::list<std::string> previous_keys_to_validate;
-        static std::string previous_parser_name;
-        static std::unordered_set<std::string> previous_supported_keys;
-        // (1) If incoming node is not the same as previous, it
-        //     means we processing new layer of parameters.
-        if (!(node == previous_layer)) {
-            // (2) Need to make sure that all children nodes of
-            //     previous layer have been checked and 100% supported.
-            if (!previous_keys_to_validate.empty()) {
-                const auto& key = previous_keys_to_validate.front();
-                const auto mark = previous_layer[key].Mark();
+        // YAML config here is parsed in-depth and parsing is sequential.
+        // This means that one YAML node, that is to be converted multiple times to
+        // different types, for example, OpDesc, will be converted in order till the
+        // deepest level (leaf):
+        // OpDesc -> InferOp -> ONNXRTParams -> ONNXRTParams::EP -> ONNXRTParams::OpenVINO.
+        //
+        // So, to check that all keys of OpDesc are supported we allow different parsers
+        // (converters) to pass the same node into this function but with different supported keys.
+        // Until the new node is passed into this stateful function, all child nodes of
+        // current node are checked against different supported keys. If at the deepest level
+        // of conversion (identified with leaf_call == true), any unchecked child node remains
+        // exception is thrown that unsupported key is used.
+        static YAML::Node current_node;
+        static std::list<std::string> current_keys_to_validate;
+
+        // (1) If this is call for the new node under test:
+        if (!(current_node == node)) {
+            // (2) Cache new node.
+            current_node = node;
+            // (3) Cache its keys.
+            current_keys_to_validate.clear();
+            for (const auto& child_node : node) {
+                const auto key = child_node.first.as<std::string>();
+                current_keys_to_validate.push_back(key);
+            }
+        }
+
+        // (4) Validate with incoming vector of supported parameters,
+        //     all remained child nodes of the current node.
+        for (auto keys_it = current_keys_to_validate.begin(); keys_it != current_keys_to_validate.end();)
+        {
+            const std::string key = *keys_it;
+            if (supported_keys.find(key) != supported_keys.end()) {
+                // (5) If key is found in vector of supported ones, remove it
+                //     from pool to validate.
+                keys_it = current_keys_to_validate.erase(keys_it);
+            } else {
+                ++keys_it;
+            }
+        }
+
+        // (6) If this is leaf call for the node under test:
+        if (leaf_call) {
+            // (7) Need to make sure that all children nodes of
+            //     this one have been checked to be 100% supported.
+            if (!current_keys_to_validate.empty()) {
+                const auto& key = current_keys_to_validate.front();
+                const auto mark = node[key].Mark();
                 std::stringstream ss;
                 ss << "Error in config YAML file at line " << mark.line + 1 << " column: " << mark.column << "." << std::endl;
-                ss << "\"" << key << "\" is unsupported as parameter of " << previous_parser_name << ", following parameters "
+                ss << "\"" << key << "\" is unsupported as parameter of " << parser_name << ", following parameters "
                    << "are supported instead:" << std::endl;
                 ss << "[ ";
-                for (auto it = previous_supported_keys.begin(); it != previous_supported_keys.end(); it++) {
+                for (auto it = supported_keys.begin(); it != supported_keys.end(); it++) {
                     auto sep = ", ";
                     auto it_copy = it;
-                    if (++it_copy == previous_supported_keys.end()) {
+                    if (++it_copy == supported_keys.end()) {
                         sep = "";
                     }
                     ss << "\"" << *(it) << "\"" << sep;
@@ -171,32 +206,8 @@ namespace {
                 ss << " ].";
                 THROW_ERROR(ss.str());
             }
-            // (3) Cache new layer.
-            previous_layer = node;
-            previous_keys_to_validate.clear();
-            for (const auto& child_node : node) {
-                const auto key = child_node.first.as<std::string>();
-                previous_keys_to_validate.push_back(key);
-            }
         }
 
-        // (4) Validate with incoming vector of supported parameters,
-        //     all child nodes of the layer.
-        for (auto keys_it = previous_keys_to_validate.begin(); keys_it != previous_keys_to_validate.end();)
-        {
-            const std::string key = *keys_it;
-            if (supported_keys.find(key) != supported_keys.end()) {
-                // (5) If key is found in vector of supported ones, remove it
-                //     from pool to validate.
-                keys_it = previous_keys_to_validate.erase(keys_it);
-            } else {
-                ++keys_it;
-            }
-        }
-
-        // (6) Update previous parser and supported keys to passed ones
-        previous_parser_name = parser_name;
-        previous_supported_keys = supported_keys;
     }
 }
 
@@ -245,7 +256,7 @@ template <>
 struct convert<UniformGenerator::Ptr> {
     static bool decode(const Node& node, UniformGenerator::Ptr& generator) {
         const std::unordered_set<std::string> parameters = {"low", "high"};
-        validateNodeKeys("UniformGenerater", node, parameters);
+        validateNodeKeys("UniformGenerater", node, parameters, true);
 
         if (!node["low"]) {
             THROW_ERROR("Uniform distribution must have \"low\" attribute");
@@ -281,7 +292,7 @@ template <>
 struct convert<Norm::Ptr> {
     static bool decode(const Node& node, Norm::Ptr& metric) {
         const std::unordered_set<std::string> parameters = {"tolerance"};
-        validateNodeKeys("Norm", node, parameters);
+        validateNodeKeys("Norm", node, parameters, true);
 
         // NB: If bigger than tolerance - fail.
         if (!node["tolerance"]) {
@@ -298,7 +309,7 @@ struct convert<Cosine::Ptr> {
     static bool decode(const Node& node, Cosine::Ptr& metric) {
         // NB: If lower than threshold - fail.
         const std::unordered_set<std::string> parameters = {"threshold"};
-        validateNodeKeys("Cosine", node, parameters);
+        validateNodeKeys("Cosine", node, parameters, true);
 
         if (!node["threshold"]) {
             THROW_ERROR("Metric \"cosine\" must have \"threshold\" attribute!");
@@ -313,7 +324,7 @@ template <>
 struct convert<NRMSE::Ptr> {
     static bool decode(const Node& node, NRMSE::Ptr& metric) {
         const std::unordered_set<std::string> parameters = {"tolerance"};
-        validateNodeKeys("NRMSE", node, parameters);
+        validateNodeKeys("NRMSE", node, parameters, true);
 
         // NB: If bigger than tolerance - fail.
         if (!node["tolerance"]) {
@@ -351,7 +362,7 @@ struct convert<GlobalOptions> {
         const std::unordered_set<std::string> parameters = {
            "model_dir", "blob_dir", "device_name", "compiler_type", "log_level",
            "save_validation_outputs"};
-        validateNodeKeys("GlobalOptions", node, parameters);
+        validateNodeKeys("GlobalOptions", node, parameters, true);
 
         if (node["model_dir"]) {
             if (!node["model_dir"]["local"]) {
@@ -393,7 +404,7 @@ struct convert<OpenVINOParams> {
     static bool decode(const Node& node, OpenVINOParams& params) {
         const std::unordered_set<std::string> parameters = {
             "priority", "config", "device", "ip", "op", "il", "ol", "iml", "oml", "reshape", "nireq" };
-        validateNodeKeys("OpenVINOParams", node, parameters);
+        validateNodeKeys("OpenVINOParams", node, parameters, true);
 
         // FIXME: Worth to separate these two
         const auto name = node["name"] ? node["name"].as<std::string>() : node["path"].as<std::string>();
@@ -462,7 +473,7 @@ template <>
 struct convert<ONNXRTParams::OpenVINO> {
     static bool decode(const Node& node, ONNXRTParams::OpenVINO& ov_ep) {
         const std::unordered_set<std::string> parameters = {"device_type", "params"};
-        validateNodeKeys("ONNXRTParams::OpenVINO Execution Provider", node, parameters);
+        validateNodeKeys("ONNXRTParams::OpenVINO Execution Provider", node, parameters, true);
 
         if (node["params"]) {
             ov_ep.params_map = node["params"].as<std::map<std::string, std::string>>();
@@ -502,7 +513,7 @@ struct convert<ONNXRTParams> {
     static bool decode(const Node& node, ONNXRTParams& params) {
         const std::unordered_set<std::string> parameters = {
             "ep", "session_options", "opt_level" };
-        validateNodeKeys("ONNXRTParams", node, parameters);
+        validateNodeKeys("ONNXRTParams", node, parameters, true);
 
         // FIXME: Worth to separate these two
         params.model_path = node["name"] ? node["name"].as<std::string>() : node["path"].as<std::string>();
@@ -562,7 +573,7 @@ template <>
 struct convert<CPUOp> {
     static bool decode(const Node& node, CPUOp& op) {
         const std::unordered_set<std::string> parameters = {"time_in_us"};
-        validateNodeKeys("CPUOp", node, parameters);
+        validateNodeKeys("CPUOp", node, parameters, true);
 
         op.time_in_us = node["time_in_us"] ? node["time_in_us"].as<uint64_t>() : 0u;
         return true;
@@ -810,11 +821,6 @@ static InferenceParams adjustParams(InferenceParams&& params, const GlobalOption
 StreamDesc parseStream(const YAML::Node& node, const GlobalOptions& opts, const std::string& default_name,
                        const ReplaceBy& replace_by) {
     StreamDesc stream;
-    const std::unordered_set<std::string> parameters = {
-        "name", "iteration_count", "exec_time_in_secs",
-        "frames_interval_in_ms", "target_fps", "target_latency_in_ms"
-    };
-    validateNodeKeys("Stream", node, parameters);
 
     // FIXME: Create a function for the duplicate code below
     stream.name = node["name"] ? node["name"].as<std::string>() : default_name;
@@ -868,10 +874,14 @@ std::vector<std::vector<Network>> parseNetworks(const YAML::Node& node) {
 
 StreamDesc parseSequenceStream(const YAML::Node& node, const GlobalOptions& opts, const std::string& default_name,
                                const ReplaceBy& replace_by) {
-    const std::unordered_set<std::string> parameters = { "network", "delay_in_us" };
-    validateNodeKeys("Network Sequence", node, parameters);
-
     StreamDesc stream = parseStream(node, opts, default_name, replace_by);
+
+    const std::unordered_set<std::string> parameters = {
+        "name", "iteration_count", "exec_time_in_secs",
+        "frames_interval_in_ms", "target_fps", "target_latency_in_ms",
+        "network", "delay_in_us"
+    };
+    validateNodeKeys("Network Sequence", node, parameters, true);
   
     auto networks_list = parseNetworks(node["network"]);
     const auto delay_in_us = node["delay_in_us"] ? node["delay_in_us"].as<uint32_t>() : 0u;
@@ -891,10 +901,14 @@ StreamDesc parseSequenceStream(const YAML::Node& node, const GlobalOptions& opts
 
 StreamDesc parseGraphStream(const YAML::Node& node, const GlobalOptions& opts,
                             const std::string& default_name, const ReplaceBy& replace_by) {
-    const std::unordered_set<std::string> parameters = { "op_desc", "connections" };
-    validateNodeKeys("Dependency Graph", node, parameters);
-
     StreamDesc stream = parseStream(node, opts, default_name, replace_by);
+
+    const std::unordered_set<std::string> parameters = {
+        "name", "iteration_count", "exec_time_in_secs",
+        "frames_interval_in_ms", "target_fps", "target_latency_in_ms",
+        "op_desc", "connections"
+    };    
+    validateNodeKeys("Dependency Graph", node, parameters, true);
 
     auto op_descs = node["op_desc"].as<std::vector<OpDesc>>();
     std::vector<std::vector<std::string>> connections;
