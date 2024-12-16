@@ -361,7 +361,9 @@ struct convert<GlobalOptions> {
     static bool decode(const Node& node, GlobalOptions& opts) {
         const std::unordered_set<std::string> parameters = {
            "model_dir", "blob_dir", "device_name", "compiler_type", "log_level",
-           "save_validation_outputs"};
+           "save_validation_outputs", "multi_inference", "metric", "random",
+           "disable_high_resolution_waitable_timer"
+        };
         validateNodeKeys("GlobalOptions", node, parameters, true);
 
         if (node["model_dir"]) {
@@ -953,7 +955,7 @@ std::vector<StreamDesc> parseStreams(const YAML::Node& node, const GlobalOptions
             std::stringstream ss;
             ss << "Error at line " << mark.line << " column: " << mark.column << "." << std::endl;
             ss << "Stream should be either declared as Dependency Graph or Network Sequence via"
-               <<  " \"network\" or \"op_desc\"." << std::endl;
+               <<  " \"op_desc\" or \"network\"." << std::endl;
             THROW_ERROR(ss.str());
         }
         ++stream_idx;
@@ -988,10 +990,6 @@ std::vector<ScenarioDesc> parseScenarios(const YAML::Node& node, const GlobalOpt
 } // namespace anonymous
 
 Config parseConfig(const YAML::Node& node, const ReplaceBy& replace_by) {
-    const std::unordered_set<std::string> parameters = {
-        "multi_inference", "metric", "random", "disable_high_resolution_waitable_timer"};
-    validateNodeKeys("Config", node, parameters);
-
     const auto global_opts = node.as<GlobalOptions>();
 
     // FIXME: Perhaps should be done somewhere else...
