@@ -61,6 +61,7 @@ log_level: INFO
 - `iml` - **Optional**. Input model layout.
 - `oml` - **Optional**. Output model layout.
 - `reshape` - **Optional**. Set shape for input layers. For example, "input1: [1,3,224,224], input2: [1,4]" or "[1,3,224,224]" in case of one input layer.
+- `nireq` - **Optional**. Set number of infer request launched in parallel.
 
 Examples:
 ```
@@ -413,7 +414,7 @@ multi_inference:
   - network:
     - { name: A.xml, ip: FP16, input_data: A-inputs/, output_data: B-inputs/ }
       # overwrites global initializer for the model B.xml
-    - { name: B.xml, ip: FP16, input_data: B-inputs/, output_data: B-outptus/, random: { name: uniform, low: 0, high: 255.0 }
+    - { name: B.xml, ip: FP16, input_data: B-inputs/, output_data: B-outptus/, random: { dist: uniform, low: 0, high: 255.0 } }
 ```
 
 Run `Protopipe` in `reference` mode:
@@ -491,7 +492,7 @@ multi_inference:
   - network:
     - { name: A.xml, ip: FP16, input_data: A-inputs/, output_data: A-outputs/ }
       # overwrites the global metric for the model B.xml
-    - { name: B.xml, ip: FP16, input_data: B-inputs/, output_data: B-outputs/, metric: { name: norm, tolerance: 0.0 }
+    - { name: B.xml, ip: FP16, input_data: B-inputs/, output_data: B-outputs/, metric: { name: norm, tolerance: 0.0 } }
 ```
 
 Use `reference` mode to generate the input random data for every model and calculate reference outputs
