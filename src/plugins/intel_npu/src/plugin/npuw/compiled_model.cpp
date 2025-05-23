@@ -168,6 +168,16 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
       m_loaded_from_cache(false) {
     ::intel_npu::registerNPUWOptions(*m_options_desc);
 
+    std::cout << "Outputs of model" << std::endl;
+    for (auto&& output: model->outputs()) {
+        std::cout << output.get_any_name() << std::endl;
+    }
+
+    std::cout << "Outputs from beginning" << std::endl;
+    for (auto&& output: outputs()) {
+        std::cout << output.get_any_name() << std::endl;
+    }
+
     std::map<std::string, ov::Any> npuw_props;
     split_properties(properties, m_non_npuw_props, npuw_props);
 
@@ -278,6 +288,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                         // FIXME: There may be a problem, see below (!)
                         LOG_BLOCK();
                         LOG_VERB("MATCHED WITH " << orig_results[j]);
+                        std::cout << orig_results[j]->get_output_tensor(0).get_any_name() << std::endl;
                         m_outputs_to_submodels_outputs[j] = {id, i};
                     }
                 }
@@ -299,6 +310,10 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         }
     }  // for(ordered_subgraphs)
     // NOTE(dm): there's a better way to do it, like we do in G-API backends.
+    std::cout << "Outputs before model creation" << std::endl;
+    for (auto&& output: outputs()) {
+        std::cout << output.get_any_name() << std::endl;
+    }
 
     // Store mapping between manually splitted inputs/outputs
     // to connect tensors between compiled submodels
@@ -1285,6 +1300,7 @@ void ov::npuw::CompiledModel::report_io() const {
         const auto& submodel_idx = from_submodel.first;
         const auto& output_idx = from_submodel.second;
         LOG_VERB("Output (Result) " << outputs()[idx_out] << " from Subgraph[" << submodel_idx << "]/" << output_idx);
+        LOG_VERB("Output name: " << outputs()[idx_out].get_any_name());
         idx_out++;
     }
 }

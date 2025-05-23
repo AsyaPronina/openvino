@@ -40,6 +40,7 @@ ov::ICompiledModel::ICompiledModel(const std::shared_ptr<const ov::Model>& model
             // getInputs / getOutputs. Since these functions are designed to be used in new API only
             // always need to add operation names for IR v10
             add_operation_names = ir_version == 10;
+            std::cout << "add_operation_names: " << std::boolalpha << add_operation_names << std::endl;
 
             if (add_operation_names) {
                 for (const auto& vals : {model->inputs(), model->outputs()}) {
@@ -86,13 +87,17 @@ ov::ICompiledModel::ICompiledModel(const std::shared_ptr<const ov::Model>& model
                                                                       result->get_output_partial_shape(0));
             OPENVINO_SUPPRESS_DEPRECATED_START
             const std::string res_name = ov::op::util::create_ie_output_name(result->input_value(0));
+            std::cout << "res_name: " << res_name << std::endl;
             OPENVINO_SUPPRESS_DEPRECATED_END
             fake_param->set_friendly_name(res_name);
             fake_param->set_element_type(result->get_element_type());
             fake_param->validate_and_infer_types();
             auto new_result = result->copy_with_new_inputs({fake_param});
             new_result->set_friendly_name(result->get_friendly_name());
+            std::cout << result->get_friendly_name() << std::endl;
+            std::cout << new_result->get_friendly_name() << std::endl;
             if (add_operation_names) {
+                std::cout << "HERE" << std::endl;
                 OPENVINO_ASSERT(leaf_names.find(res_name) == leaf_names.end() ||
                                     result->output(0).get_names().find(res_name) != result->output(0).get_names().end(),
                                 "Model operation names have collisions with tensor names.",
@@ -106,10 +111,13 @@ ov::ICompiledModel::ICompiledModel(const std::shared_ptr<const ov::Model>& model
             new_result->output(0).get_rt_info() = result->output(0).get_rt_info();
             auto old_tensor = result->output(0).get_tensor_ptr();
             if (tensor_map.count(old_tensor)) {
+                std::cout << "here!" << std::endl;
                 new_result->output(0).set_tensor_ptr(tensor_map[old_tensor]);
             } else {
+                std::cout << "here2!" << std::endl;
                 tensor_map[old_tensor] = new_result->output(0).get_tensor_ptr();
             }
+            std::cout << "new_result->output(0): " << new_result->output(0).get_any_name() << std::endl;
             m_outputs.emplace_back(new_result->output(0));
         }
     }

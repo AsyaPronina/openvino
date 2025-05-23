@@ -159,6 +159,8 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         m_kvcache_in_ports.emplace(input_port.get_any_name(), input_port);
     }
     for (const auto& output_port : m_kvcache_request->get_compiled_model()->outputs()) {
+        std::cout << output_port << std::endl;
+        std::cout << output_port.get_any_name() << std::endl;
         m_kvcache_out_ports.emplace(output_port.get_any_name(), output_port);
     }
 }
