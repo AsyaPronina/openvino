@@ -5,6 +5,7 @@
 #include "llm_infer_request.hpp"
 
 #include <regex>
+#include <future>
 
 #include "llm_compiled_model.hpp"
 #include "logging.hpp"
@@ -346,19 +347,14 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[INPUT_IDS_SEQ_LEN_DIM]);
 
     if (m_tail_mm_request) {
-        LOG_DEBUG("Calling inference for tail model asynchronously...");
+        LOG_DEBUG("Calling inference for tail model.");
         m_tail_mm_request->set_tensor(
             m_tail_embed_port,
             m_prefill_request->get_tensor(m_prefill_out_ports.at(ov::npuw::LLMCompiledModel::output_embeds)));
-        m_tail_mm_request->start_async();
-        copy_kvcache();
-        m_tail_mm_request->wait();
-        LOG_DEBUG("Calling inference for tail model - done.");
+        m_tail_mm_request->infer();
 
         m_logits = m_tail_mm_request->get_tensor(m_tail_logits_port);
     } else {
-        copy_kvcache();
-
         m_logits = m_prefill_request->get_tensor(m_prefill_out_ports.at("logits"));
     }
 
@@ -373,8 +369,11 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
     LOG_DEBUG("Calling inference for generate model...");
     LOG_BLOCK();
 
-    // TODO: Use another solution than flag if multithreading comes to play,
+    // TODO: Use another solution than flag if multithreading comes to play.
     if (!m_generate_initialized) {
+        LOG_DEBUG("Copy kv-cache asynchronously...");
+        auto copy_kvcache_future = std::async(std::launch::async, &LLMInferRequest::copy_kvcache, this);
+
         LOG_DEBUG("Prepare attention mask pattern.");
         auto kv_attn_mask = m_kvcache_request->get_tensor(m_kvcache_in_ports.at("attention_mask"));
         fill_tensor<int64_t>(kv_attn_mask, 0);
@@ -388,6 +387,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                 m_kvcache_request->get_tensor(m_kvcache_out_ports.at(ov::npuw::LLMCompiledModel::output_embeds)));
         }
 
+        copy_kvcache_future.wait();
         m_generate_initialized = true;
     }
 
