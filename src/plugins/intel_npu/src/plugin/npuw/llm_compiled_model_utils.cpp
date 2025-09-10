@@ -255,8 +255,7 @@ public:
                 // the attention score.
                 if (mask.get_element_type() == element::boolean) {
                     atten_mask = register_new_node<v1::ConvertLike>(mask, scaled_atten);
-                    auto inv_mask = register_new_node<v1::LogicalNot>(mask);
-                    atten_mask = register_new_node<v1::Select>(inv_mask, atten_mask, minus_inf);
+                    atten_mask = register_new_node<v1::Select>(mask, atten_mask, minus_inf);
                 } else {
                     atten_mask = mask;
                 }
