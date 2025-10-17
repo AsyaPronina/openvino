@@ -396,6 +396,137 @@ public:
     }
 };
 
+class Phi3SlidingMask : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::Phi3SlidingMask");
+
+    explicit Phi3SlidingMask() {
+        // Searching for Phi3 sliding mask pattern to extend it to work with right-padded
+        // past tokens and left-padded present tokens.
+        //
+        // Mask creation is simply done via "less_equal" and "greater" operations between
+        // row K range: [0,... mask_len] and column Q range: [current_pos_id,... mask_len].T
+        // and sliding window length.
+        // Due to broadcasting rules these two operation form two triangular masks.
+        //
+        // -  "less_equal" forms a sliding window mask, more precisely, it has following expression:
+        //
+        //        row range [0,... mask_len] <= column range [current_pos_id - sliding_window_size,
+        //                                                    ...,
+        //                                                    mask_len    -    sliding_window_size]
+        //
+        //       forming, under example conditions, the mask below:
+        //        past tokens = 3
+        //        present tokens = 5 (starting with current_pos_id = 3)
+        //        sliding window len = 4
+        //                    K0 K1 K2 K3 K4 K5 K6 K7
+        //                   [ 0  1  2  3  4  5  6  7 ]
+        //        Q3[ 3 - 4 ]  0  0  0  0  0  0  0  0
+        //        Q4[ 4 - 4 ]  1  0  0  0  0  0  0  0
+        //        Q5[ 5 - 4 ]  1  1  0  0  0  0  0  0
+        //        Q6[ 6 - 4 ]  1  1  1  0  0  0  0  0
+        //        Q7[ 7 - 4 ]  1  1  1  1  0  0  0  0
+        //       where 1 at [i, j] means that j token should be forgotten as it can't fit into the sliding
+        //       window from the left of i-th token.
+        //
+        // -   "greater" forms a similar to self-attention mask:
+        //
+        //        row range [0,... mask_len] > column range [current_pos_id,
+        //                                                   ...,
+        //                                                   mask_len]
+        //
+        //       forming, under example conditions, the mask below:
+        //        past tokens = 3
+        //        present tokens = 5 (starting with current_pos_id = 3)
+        //                K0 K1 K2 K3 K4 K5 K6 K7
+        //               [ 0  1  2  3  4  5  6  7 ]
+        //        Q3[ 3 ]  0  0  0  0  1  1  1  1
+        //        Q4[ 4 ]  0  0  0  0  0  1  1  1
+        //        Q5[ 5 ]  0  0  0  0  0  0  1  1
+        //        Q6[ 6 ]  0  0  0  0  0  0  0  1
+        //        Q7[ 7 ]  0  0  0  0  0  0  0  0
+        //       where 1 at [i, j] means that j token is a future token for i-th token, that we shouldn't attend to.
+        //
+        // Together, via "bitwise_or" this two masks forms the inverted sliding attention mask:
+        //        past tokens = 3
+        //        present tokens = 5 (starting with current_pos_id = 3)
+        //        sliding window len = 4
+        //                    K0 K1 K2 K3 K4 K5 K6 K7
+        //                   [ 0  1  2  3  4  5  6  7 ]
+        //        Q3[ 3 - 4 ]  0  0  0  0  1  1  1  1
+        //        Q4[ 4 - 4 ]  1  0  0  0  0  1  1  1
+        //        Q5[ 5 - 4 ]  1  1  0  0  0  0  1  1
+        //        Q6[ 6 - 4 ]  1  1  1  0  0  0  0  1
+        //        Q7[ 7 - 4 ]  1  1  1  1  0  0  0  0
+        //
+        // Issue with sliding attention mask appears when we work with static shapes and different paddings for
+        // past and present tokens.
+        // More precisely, issue appears with sliding window mask, as Q column range is created from length of
+        // past key/values tensor (2175 for 2K case) as start point and the length of attention mask (2176 for 2K)
+        // as an end point. This is okay for inverted self-attention mask by means of "greater" operation,
+        // as our present tokens exactly left-padded and located on the right in the attention mask.
+        // However, for the sliding window mask created by means of "less_equal" operation, given Q range will behave
+        // as if position ids of new Q tokens will start from 2175 and not from 3 as in example above and therefore,
+        // 2175 - 2047 = 128 first tokens should be forgotten. As a fix, in "less_equal" operation, we can compare
+        // row K range [0, ...2175] with passed correct "position_ids" as a Q range, but again, shifted right on the
+        // length of window size and transposed to form a column.
+
+        auto past_kv_len = opp::wrap_type<ov::op::v8::Gather>({opp::any_input(), opp::any_input(), opp::any_input()});
+        auto pos_ids_param = opp::wrap_type<ov::op::v0::Parameter>();
+        auto pos_ids_shape_of = opp::wrap_type<ov::op::v3::ShapeOf>({pos_ids_param});
+        auto pos_ids_len = opp::wrap_type<ov::op::v8::Gather>({pos_ids_shape_of, opp::any_input(), opp::any_input()});
+        auto full_ctx_len = opp::wrap_type<ov::op::v1::Add>({past_kv_len, pos_ids_len});
+        auto query_range = opp::wrap_type<ov::op::v4::Range>({past_kv_len, full_ctx_len, opp::any_input()});
+        auto column_shape = opp::wrap_type<ov::op::v0::Constant>();
+        auto query_range_column = opp::wrap_type<ov::op::v1::Reshape>({query_range, column_shape});
+
+        auto zero_const = opp::wrap_type<ov::op::v0::Constant>();
+        auto atten_mask_len =
+            opp::wrap_type<ov::op::v8::Gather>({opp::any_input(), opp::any_input(), opp::any_input()});
+        auto key_range = opp::wrap_type<ov::op::v4::Range>({zero_const, atten_mask_len, opp::any_input()});
+        auto key_range_i64 = opp::wrap_type<ov::op::v0::Convert>({key_range});
+        auto key_range_f32 = opp::wrap_type<ov::op::v0::Convert>({key_range_i64});
+
+        auto neg_window_size = opp::wrap_type<ov::op::v0::Constant>();
+        auto query_left_bound_range = opp::wrap_type<ov::op::v1::Add>({query_range_column, neg_window_size});
+        // False in mask means that we shouldn't forget this token
+        auto forget_left_tokens_mask = opp::wrap_type<ov::op::v1::LessEqual>({key_range_f32, query_left_bound_range});
+        // Basically it is a reference triangle self-attention mask that
+        // forbids tokens to attend to future ones, but values are inverted:
+        auto look_only_future_mask = opp::wrap_type<ov::op::v1::Greater>({key_range_f32, query_range_column});
+
+        auto inv_sliding_attention_mask =
+            opp::wrap_type<ov::op::v13::BitwiseOr>({look_only_future_mask, forget_left_tokens_mask});
+
+        auto callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& node_to_output = m.get_pattern_value_map();
+            auto node_pos_ids_param = node_to_output.at(pos_ids_param).get_node_shared_ptr();
+            auto node_query_left_bound_range = node_to_output.at(query_left_bound_range).get_node_shared_ptr();
+            auto node_neg_window_size = node_to_output.at(neg_window_size).get_node_shared_ptr();
+
+            auto matched_pos_ids = std::static_pointer_cast<ov::op::v0::Parameter>(node_pos_ids_param);
+            auto matched_query_left_bound = std::static_pointer_cast<ov::op::v1::Add>(node_query_left_bound_range);
+            auto matched_neg_window_size = std::static_pointer_cast<ov::op::v0::Constant>(node_neg_window_size);
+            OPENVINO_ASSERT(matched_neg_window_size->get_output_size() == 1,
+                            "Sliding window size constant must be of size 1, but got " +
+                                std::to_string(matched_neg_window_size->get_output_size()));
+
+            auto query_range_as_pos_ids = std::make_shared<ov::op::v0::Convert>(matched_pos_ids, ov::element::f32);
+            std::vector<int64_t> vector_shape{-1, 1};
+            auto vector_shape_const =
+                std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{2}, vector_shape);
+            auto query_range_as_pos_ids_col =
+                std::make_shared<ov::op::v1::Reshape>(query_range_as_pos_ids, vector_shape_const, false);
+
+            matched_query_left_bound->input(0).replace_source_output(query_range_as_pos_ids_col);
+
+            return true;
+        };
+        register_matcher(std::make_shared<opp::Matcher>(inv_sliding_attention_mask, "Phi3SlidingMask"),
+                         std::move(callback));
+    }
+};
+
 namespace {
 uint32_t align_to(uint32_t value, uint32_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -450,6 +581,13 @@ void decompose_GQA(std::shared_ptr<ov::Model> model, bool is_prefill_model) {
     ov::pass::GraphRewrite rewr;
     rewr.add_matcher<GroupQueryAttentionDecomposition>(is_prefill_model);
     rewr.run_on_model(model);
+}
+
+void patch_phi3_sliding_mask(const std::shared_ptr<ov::Model>& model) {
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<Phi3SlidingMask>();
+    rewr.run_on_model(model);
+    model->validate_nodes_and_infer_types();
 }
 }  // namespace
 
@@ -1099,7 +1237,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                       axes,
                       m_max_lora_rank,
                       whisper_lhs_seq_size);
+
+    LOG_DEBUG("Try replace Gemma-3 Sliding window mask for generate model with parameter, if it exists");
     gemma_transformations(kvcache_model);
+    LOG_DEBUG("Try patch Phi-3 sliding window mask, if it exists.");
+    patch_phi3_sliding_mask(kvcache_model);
 
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
