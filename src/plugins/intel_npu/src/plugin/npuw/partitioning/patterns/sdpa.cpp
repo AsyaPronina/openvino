@@ -173,6 +173,68 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     register_matcher(std::make_shared<opp::Matcher>(reshape3, "TagSDPADecomposed"), std::move(callback));
 }
 
+/*
+    Decomposed SDPA Pattern:
+        \           /
+            MatMul
+    \       /
+       Add
+        |
+     Softmax
+            \               /
+                  MatMul
+                    |
+                Reshape
+                    |
+                Transpose
+                    |
+                Reshape
+                    |
+*/
+
+SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                               const std::string& isol_tag) {
+    auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), opp::any_input()});
+    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
+    auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
+
+    auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, opp::any_input()});
+    auto reshape1 = opp::wrap_type<ov::op::v1::Reshape>({matmul2, opp::any_input()});
+    auto transpose = opp::wrap_type<ov::op::v1::Transpose>({reshape1, opp::any_input()});
+    auto reshape2 = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
+
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    LOG_DEBUG("searching for Decomposed1 SDPA pattern");
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        LOG_DEBUG("Decomposed1 SDPA pattern matched!");
+
+        auto& node_to_output = m.get_pattern_value_map();
+
+        // Helper lambda to extract and isolate matched nodes
+        auto isolate_matched = [&](const auto& pattern) {
+            auto optional_node = node_to_output.find(pattern);
+            if (optional_node != node_to_output.end()) {
+                auto matched_node = optional_node->second.get_node_shared_ptr();
+                node_to_gptr->at(matched_node)->isolate(isol_tag);
+            }
+        };
+
+        isolate_matched(matmul1);
+        isolate_matched(add);
+        isolate_matched(softmax);
+        isolate_matched(matmul2);
+        isolate_matched(reshape1);
+        isolate_matched(transpose);
+        isolate_matched(reshape2);
+
+        return false;  // root hasn't changed
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(reshape2, "TagSDPADecomposed"), std::move(callback));
+}
+
 }  // namespace attn
 
 namespace regularize {

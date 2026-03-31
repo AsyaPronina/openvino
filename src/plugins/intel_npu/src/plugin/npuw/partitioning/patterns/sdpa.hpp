@@ -34,6 +34,13 @@ public:
     SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
 };
 
+class SDPADecomposed1 : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::attn::SDPADecomposed1");
+    SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
+};
+
+
 }  // namespace attn
 
 namespace regularize {
