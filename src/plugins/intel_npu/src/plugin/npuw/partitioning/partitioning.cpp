@@ -805,23 +805,47 @@ void Partitioner::identifySubgraphs() {
 std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType utype) {
     func_pipeline_type = utype;
 
-    // Collect all groups of function call(s) and process them in groups
+    // [FOLD only] Determine the canonical (prototype) output count for each group.
+    // The first call site seen for each _repeated_id defines the boundary; call
+    // sites with a different count are assigned to a new sub-group below so that
+    // all downstream passes (propagateConvertsOut, sanityCheck, …) always see
+    // internally-consistent groups with a uniform output boundary.
+    std::map<std::string, std::size_t> canonical_count;
+    if (func_pipeline_type == FunctionPipelineType::FOLD) {
+        for (auto&& part_sg : P.subgraphs) {
+            if (!part_sg._repeated_id.empty())
+                canonical_count.emplace(part_sg._repeated_id, part_sg._results.size());
+        }
+    }
+
+    // Assign each call site to the correct function group.
     std::map<std::string, int> idx;
+    std::map<std::string, std::map<std::size_t, std::string>> sub_group_ids;  // orig_id -> {n_out -> sub_id}
+    std::map<std::string, int> split_counter;
     for (auto&& part_sg : P.subgraphs) {
         if (!part_sg._repeated_id.empty()) {
-            auto pfix = "__" + std::to_string(idx[part_sg._repeated_id]++);
-            const auto& fcid = func_pipeline_type == FunctionPipelineType::FOLD
-                                   ? part_sg._repeated_id          // with folding, functions of the
-                                                                   // same group have the same id
-                                   : part_sg._repeated_id + pfix;  // with CWAI (which is not checked here)
-                                                                   // every function gets its own id
+            const auto& orig_id = part_sg._repeated_id;
+            auto pfix = "__" + std::to_string(idx[orig_id]++);
+            std::string fcid;
+            if (func_pipeline_type == FunctionPipelineType::FOLD &&
+                part_sg._results.size() != canonical_count.at(orig_id)) {
+                // Output count differs from the prototype: assign to a sub-group,
+                // creating it on first encounter, and fix _repeated_id immediately.
+                auto& sub_id = sub_group_ids[orig_id][part_sg._results.size()];
+                if (sub_id.empty())
+                    sub_id = orig_id + "_S" + std::to_string(split_counter[orig_id]++);
+                fcid = sub_id;
+                part_sg._repeated_id = fcid;
+            } else {
+                fcid = func_pipeline_type == FunctionPipelineType::FOLD ? orig_id : orig_id + pfix;
+            }
             auto& u = all_functions[fcid];
             u.refs.push_back(std::ref(part_sg));
             u.mdls.push_back(
                 std::make_shared<ov::Model>(part_sg._results,
                                             part_sg._sinks,
                                             part_sg._parameters,
-                                            model->get_friendly_name() + "_" + part_sg._repeated_id + pfix));
+                                            model->get_friendly_name() + "_" + orig_id + pfix));
         }
     }
 
@@ -834,6 +858,59 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
             p.second.refs.front().get()._repeated_id = p.first;
         }
         return functions;
+    }
+
+    // For any groups that had call sites split off, partition the ens.repeated banks
+    // between the original group and each sub-group in a single pass, then register
+    // the sub-group blocks.  The layer_to_prototype loop below handles all groups
+    // uniformly, so no separate rebase step is needed.
+    for (auto& [orig_id, count_to_sub] : sub_group_ids) {
+        auto& orig_block = ens.repeated.at(orig_id);
+
+        // Build name-to-sub_id maps by iterating the already-created sub-group models.
+        std::unordered_map<std::string, std::string> layer_to_sub;
+        std::unordered_map<std::string, std::string> const_to_sub;
+        for (auto& [count, sub_id] : count_to_sub) {
+            LOG_WARN("initFunctionPipeline: sub-group " << sub_id << " split from " << orig_id
+                     << " (" << count << " output(s) vs " << canonical_count.at(orig_id) << " in proto)");
+            for (auto& mdl : all_functions.at(sub_id).mdls) {
+                for (auto&& node : mdl->get_ordered_ops()) {
+                    if (ov::op::util::is_constant(node))
+                        const_to_sub[get_unique_name(node)] = sub_id;
+                    else if (!ov::op::util::is_parameter(node) && !ov::op::util::is_output(node))
+                        layer_to_sub[node->get_friendly_name()] = sub_id;
+                }
+            }
+        }
+
+        // Partition each bank: entries belonging to a sub-group go into sub_blocks;
+        // the rest remain in the original group.  Both the split and the pruning of
+        // the original happen in the same single pass via a pointer-to-member.
+        std::map<std::string, ov::npuw::RepeatedBlock> sub_blocks;
+        auto partition = [&](ov::npuw::RepeatedBlock::MatchedBank& bank,
+                             const std::unordered_map<std::string, std::string>& name_to_sub,
+                             ov::npuw::RepeatedBlock::MatchedBank ov::npuw::RepeatedBlock::* dst) {
+            ov::npuw::RepeatedBlock::MatchedBank remain;
+            for (auto& entry : bank) {
+                ov::npuw::RepeatedBlock::MatchedLayers kept;
+                std::map<std::string, ov::npuw::RepeatedBlock::MatchedLayers> split;
+                for (auto& name : entry) {
+                    auto it = name_to_sub.find(name);
+                    if (it != name_to_sub.end()) split[it->second].insert(name);
+                    else kept.insert(name);
+                }
+                if (!kept.empty()) remain.push_back(std::move(kept));
+                for (auto& [sub_id, layers] : split)
+                    (sub_blocks[sub_id].*dst).push_back(std::move(layers));
+            }
+            bank = std::move(remain);
+        };
+        partition(orig_block.matches, layer_to_sub, &ov::npuw::RepeatedBlock::matches);
+        partition(orig_block.consts,  const_to_sub, &ov::npuw::RepeatedBlock::consts);
+        partition(orig_block.scalars, const_to_sub, &ov::npuw::RepeatedBlock::scalars);
+
+        for (auto& [sub_id, rb] : sub_blocks)
+            ens.repeated[sub_id] = std::move(rb);
     }
 
     // Then, populate a list of functions and the early layer_to_prototype mapping.
