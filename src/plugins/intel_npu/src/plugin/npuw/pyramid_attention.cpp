@@ -356,7 +356,7 @@ SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model
 
             // Allow traversing through Reshape and Transpose
             if (ov::is_type<ov::op::v1::Reshape>(current_node) || ov::is_type<ov::op::v3::Broadcast>(current_node) ||
-                ov::is_type<ov::op::v0::Unsqueeze>(current_node)) {
+                ov::is_type<ov::op::v0::Unsqueeze>(current_node) || ov::is_type<ov::op::v1::Transpose>(current_node) || ov::is_type<ov::op::v1::Multiply>(current_node)) {
                 if (current_node->get_input_size() > 0) {
                     current_node = current_node->input(0).get_source_output().get_node_shared_ptr();
                 } else {

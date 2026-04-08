@@ -194,11 +194,27 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
 
 SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                                const std::string& isol_tag) {
-    auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), opp::any_input()});
-    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
+
+    auto concat1 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input()});
+    auto convert1 = opp::wrap_type<ov::op::v0::Convert>({concat1});
+    auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({convert1, opp::any_input()});
+    auto transpose1 = opp::wrap_type<ov::op::v1::Transpose>({multiply1, opp::any_input()});
+    auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), transpose1});
+
+    auto shape_of = opp::wrap_type<ov::op::v3::ShapeOf>({multiply1});
+    auto gather = opp::wrap_type<ov::op::v8::Gather>({shape_of, opp::any_input(), opp::any_input()});
+    auto constant = opp::wrap_type<ov::op::v0::Constant>();
+    auto concat_gather = opp::wrap_type<ov::op::v0::Concat>({ opp::any_input(),  constant,  opp::any_input(), gather});
+    auto reshape_gather = opp::wrap_type<ov::op::v1::Reshape>({concat_gather, opp::any_input()});
+    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, reshape_gather});
+
     auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
 
-    auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, opp::any_input()});
+    auto concat2 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input()});
+    auto convert2 = opp::wrap_type<ov::op::v0::Convert>({concat2});
+    auto multiply2 = opp::wrap_type<ov::op::v1::Multiply>({convert2, opp::any_input()});
+
+    auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, multiply2});
     auto reshape1 = opp::wrap_type<ov::op::v1::Reshape>({matmul2, opp::any_input()});
     auto transpose = opp::wrap_type<ov::op::v1::Transpose>({reshape1, opp::any_input()});
     auto reshape2 = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
@@ -221,9 +237,25 @@ SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapsho
             }
         };
 
+        isolate_matched(concat1);
+        isolate_matched(convert1);
+        isolate_matched(multiply1);
+        isolate_matched(transpose1);
         isolate_matched(matmul1);
+
+        isolate_matched(shape_of);
+        isolate_matched(gather);
+        isolate_matched(constant);
+        isolate_matched(concat_gather);
+        isolate_matched(reshape_gather);
         isolate_matched(add);
+
         isolate_matched(softmax);
+
+        isolate_matched(concat2);
+        isolate_matched(convert2);
+        isolate_matched(multiply2);
+
         isolate_matched(matmul2);
         isolate_matched(reshape1);
         isolate_matched(transpose);
