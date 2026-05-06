@@ -937,7 +937,10 @@ std::shared_ptr<Repeated> Snapshot::tryMergeTriangles(const std::vector<Group::G
         return {};
     }
 
-    if (prods.size() < m_ctx.keep_blocks) {
+    // Same bypass as in tryMergeRepeating: groups tagged by earlyRegroup must
+    // always be allowed to grow regardless of the keep_blocks threshold.
+    const bool has_isolated_tag = !prods.front()->isolatedTag().empty();
+    if (!has_isolated_tag && prods.size() < m_ctx.keep_blocks) {
         // In some cases (specifically mixed precision) during MergeUniques() pass we could be left with
         // E.g. 10 repeated blocks with tag AAA and 2 repeated blocks with tag BBB
         // TryMergeTriangles() pass checks that producer and consumer have a different tag to be merged further.
@@ -1188,7 +1191,13 @@ std::shared_ptr<Repeated> Snapshot::tryMergeRepeating(const std::vector<Group::G
         }
     }
 
-    if (prods.size() < m_ctx.keep_blocks) {
+    // Groups tagged by earlyRegroup (e.g. "attn") must always be allowed to grow,
+    // regardless of the keep_blocks threshold, because the pattern-matcher
+    // explicitly requested their isolation. Without this bypass, archetypes that
+    // have fewer instances than keep_blocks (e.g. 7 global-attention blocks when
+    // keep_blocks==10) are silently dropped and later fused into FCEW singletons.
+    const bool has_isolated_tag = !conss.front()->isolatedTag().empty();
+    if (!has_isolated_tag && prods.size() < m_ctx.keep_blocks) {
         // In some cases (specifically mixed precision) during MergeUniques() pass we could be left with
         // E.g. 10 repeated blocks with tag AAA and 2 repeated blocks with tag BBB
         // TryMergeRepeating() pass checks that producer and consumer have a different tag to be merged further.
@@ -1281,6 +1290,25 @@ bool Snapshot::cleanUpUniquesImpl(const GPtrSet& gptrs) {
             LOG_VERB("Keeping a repeated block of " << gptrs.size() << " groups with " << block_layer_size
                                                     << " layers - has AVOIDs");
             // Special case - keep it
+            for (const auto& g : gptrs) {
+                g->freeze();
+            }
+            return true;
+        }
+    }
+
+    // Repeated groups whose nodes were tagged by earlyRegroup (e.g. "attn" from
+    // SDPADecomposed1) must always be kept regardless of the keep_blocks /
+    // keep_block_size thresholds.  Those tags signal that a pattern-matcher
+    // explicitly requested isolation; if the group is small (e.g. only 7 global-
+    // attention blocks exist when keep_blocks==10) we must still freeze it so that
+    // fuseRemnantsExtended cannot dissolve the shared Tile node into one of the
+    // instances, which would make them structurally inequivalent.
+    for (const auto& gptr : gptrs) {
+        if (!gptr->isolatedTag().empty()) {
+            auto block_layer_size = (*(gptrs.begin()))->size();
+            LOG_VERB("Keeping a repeated block of " << gptrs.size() << " groups with " << block_layer_size
+                                                    << " layers - has isolated tag '" << gptr->isolatedTag() << "'");
             for (const auto& g : gptrs) {
                 g->freeze();
             }
