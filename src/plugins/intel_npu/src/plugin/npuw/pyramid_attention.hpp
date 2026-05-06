@@ -219,6 +219,7 @@ class PositionIDs final : public Selector {
     int64_t m_current_length = 0;
     int64_t m_past_length = 0;
     std::size_t m_query_size = 0u;
+    std::size_t m_pyramid_step = 0u;  // context increment per pyramid level
 
     // Store pyramid attention reference for pyramid model selection
     const compiled::PyramidAttention* m_pyramid_attention = nullptr;

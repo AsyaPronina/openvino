@@ -553,8 +553,10 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
             return false;  // Early return
         }
 
-        auto pyramid_id = m_pyramid_selector->pyramid_id();
-        auto& pyramid_attn = proto_comp_model_desc.pyramid_attention.value()._attention_infos[pyramid_id];
+        auto raw_pyramid_id = m_pyramid_selector->pyramid_id();
+        const auto& pyrm_attn_infos = proto_comp_model_desc.pyramid_attention.value()._attention_infos;
+        auto pyramid_id = std::min(raw_pyramid_id, pyrm_attn_infos.size() - 1);
+        auto& pyramid_attn = pyrm_attn_infos[pyramid_id];
         return std::any_of(pyramid_attn.params.begin(), pyramid_attn.params.end(), [&](const auto& p) -> bool {
             return p.idx == sub_in_idx;
         });
@@ -808,8 +810,9 @@ void ov::npuw::IBaseInferRequest::bind_pyramid_attention_inputs(std::size_t idx,
     LOG_DEBUG("Binding Pyramid Attention inputs...");
     LOG_BLOCK();
 
-    const auto pyramid_id = m_pyramid_selector->pyramid_id();
+    const auto raw_pyramid_id = m_pyramid_selector->pyramid_id();
     const auto& pyramid_attention = comp_model_desc.pyramid_attention.value();
+    const auto pyramid_id = std::min(raw_pyramid_id, pyramid_attention._attention_infos.size() - 1);
     const auto& attention_info = pyramid_attention._attention_infos[pyramid_id];
     const auto& pyramid_model = pyramid_attention._compiled_models[pyramid_id];
 
@@ -855,7 +858,8 @@ void ov::npuw::IBaseInferRequest::bind_pyramid_attention_inputs(std::size_t idx,
 
             // Handle empty shape case (first chunk)
             if (ov::shape_size(shape) == 0) {
-                request->get_tensor(iport)->set_shape(shape);
+                auto dst_tensor = request->get_tensor(iport);
+                dst_tensor->set_shape(shape);
                 continue;
             }
 

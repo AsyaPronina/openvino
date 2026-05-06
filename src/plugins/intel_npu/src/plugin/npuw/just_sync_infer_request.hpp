@@ -179,6 +179,12 @@ protected:
     // Cached attention mask for SDPA operations to avoid recomputing
     ov::SoPtr<ov::ITensor> m_cached_attention_mask;
 
+    // Cached attention mask for pyramid SDPA operations.
+    // Keyed by real_idx so that different attention function bodies (local vs global)
+    // each maintain their own cache and don't cross-contaminate.
+    ov::SoPtr<ov::ITensor> m_cached_pyramid_attention_mask;
+    std::size_t m_cached_pyramid_attention_mask_real_idx = std::numeric_limits<std::size_t>::max();
+
     // HFA runtime context (holds cached masks, pre-allocated buffers, and state buffers)
     std::optional<runtime::host_flash_attention::HFARuntimeContext> m_hfa_runtime_ctx;
 

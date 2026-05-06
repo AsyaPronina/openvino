@@ -119,8 +119,12 @@ std::optional<PyramidModelResult> process_pyramid_model(const std::shared_ptr<ov
         current_past_length = current_context_length - query_length;
     } else {
         // PREFILL
+        // pyramid_step is the actual KV context increment (= new_K_size per step).
+        // For standard attention, pyramid_step == query_length.
+        // For global attention patterns (e.g. SDPADecomposed1) they can differ:
+        // query_length may span multiple local blocks while new_K_size is just one.
         current_context_length = (model_idx + 1) * pyramid_step;
-        current_past_length = current_context_length - query_length;
+        current_past_length = current_context_length - pyramid_step;
     }
     // FIXME: Probably the generic formula for all cases is:
     // current_context_length = (model_idx + 1) * pyramid_step;
@@ -129,6 +133,7 @@ std::optional<PyramidModelResult> process_pyramid_model(const std::shared_ptr<ov
     LOG_DEBUG("Model " << model_idx << ":");
     LOG_DEBUG("  Context length: " << current_context_length);
     LOG_DEBUG("  Past length: " << current_past_length);
+    LOG_DEBUG("  Query length: " << query_length);
 
     // Create initial Attention instance to get mask parameter for reshaping
     auto initial_attention =
@@ -356,7 +361,8 @@ SDPAPatternNodes find_sdpa_pattern_nodes(const std::shared_ptr<ov::Model>& model
 
             // Allow traversing through Reshape and Transpose
             if (ov::is_type<ov::op::v1::Reshape>(current_node) || ov::is_type<ov::op::v3::Broadcast>(current_node) ||
-                ov::is_type<ov::op::v0::Unsqueeze>(current_node) || ov::is_type<ov::op::v1::Transpose>(current_node) || ov::is_type<ov::op::v1::Multiply>(current_node)) {
+                ov::is_type<ov::op::v0::Unsqueeze>(current_node) || ov::is_type<ov::op::v1::Transpose>(current_node) ||
+                ov::is_type<ov::op::v1::Multiply>(current_node) || ov::is_type<ov::op::v0::Convert>(current_node)) {
                 if (current_node->get_input_size() > 0) {
                     current_node = current_node->input(0).get_source_output().get_node_shared_ptr();
                 } else {
@@ -437,7 +443,13 @@ std::optional<PyramidAttention> PyramidAttention::from(const std::shared_ptr<ov:
     // FIXME: Make it configurable
     // FIXME: Handle the speculative case here (query_length > 1; << 1024)
     bool is_generate = query_length == 1;
-    size_t pyramid_step = is_generate ? 1024u : query_length;
+    // For PREFILL: the context grows by kv_step per pyramid level, where kv_step is
+    // the number of new K tokens added per inference (= concat input 0 sequence size).
+    // For standard attention: kv_step == query_length.
+    // For global attention (SDPADecomposed1): kv_step < query_length because the
+    // query spans multiple local blocks while K_new is just one block's worth.
+    size_t kv_step = full_context_length - full_past_kv_length;
+    size_t pyramid_step = is_generate ? 1024u : kv_step;
     // FIXME: Check all the right alignments
     size_t num_models = full_context_length / pyramid_step;
     LOG_INFO("Creating " << num_models << " pyramid attention models");
@@ -559,6 +571,10 @@ namespace pyramid_attention {
 PositionIDs::PositionIDs(std::size_t param_idx, const compiled::PyramidAttention& d, const ov::ISyncInferRequest& rq)
     : m_position_ids_idx(param_idx),
       m_query_size(d.query_size),
+      // The pyramid step is the context length of the smallest (first) pyramid model.
+      // For standard attention: pyramid_step == query_size.
+      // For global attention (SDPADecomposed1): pyramid_step < query_size.
+      m_pyramid_step(d._context_lengths.empty() ? d.query_size : d._context_lengths[0]),
       m_pyramid_attention(&d),
       m_rq(rq) {
     // FIXME: speculative decode is indistinguishable at this point!
@@ -586,22 +602,32 @@ void PositionIDs::prepare(int64_t past_len) {
     const auto& iport = m_rq.get_compiled_model()->inputs()[m_position_ids_idx];
     const auto in_tensor = m_rq.get_tensor(iport);
     const auto in_dims = in_tensor->get_shape();
+    const auto elem_type = in_tensor->get_element_type();
 
-    // Same logic as regular attention PositionIDs
-    auto* pos_data_ptr = in_tensor->data<int64_t>();
+    // Read a single position ID value, handling both i32 and i64 tensors
+    auto get_pos = [&](size_t i) -> int64_t {
+        if (elem_type == ov::element::i64) {
+            return in_tensor->data<int64_t>()[i];
+        } else if (elem_type == ov::element::i32) {
+            return static_cast<int64_t>(in_tensor->data<int32_t>()[i]);
+        }
+        return 0;
+    };
+
     for (int64_t idx = static_cast<int64_t>(in_dims.back()) - 1; idx >= 0; idx--) {
-        if (pos_data_ptr[idx] > 0) {
+        if (get_pos(idx) > 0) {
             // Initialize fields
-            m_current_length = pos_data_ptr[idx];
+            m_current_length = get_pos(idx);
             switch (m_case) {
             case Case::GENERATE:
                 // decode case, we have pos_id-1 past elements to take from kvcache
                 m_past_length = m_current_length;
                 break;
             case Case::PREFILL:
-                // chunked prefill case. calculate the past_length in full chunks
-                // FIXME: We know too much about chunking here
-                m_past_length = ((past_len + m_query_size - 1) / m_query_size) * m_query_size;
+                // chunked prefill case. calculate the past_length in full pyramid steps.
+                // Use pyramid_step (= kv context increment per level) for rounding,
+                // not query_size, since for global attention they differ.
+                m_past_length = ((past_len + m_pyramid_step - 1) / m_pyramid_step) * m_pyramid_step;
                 break;
             default:
                 NPUW_ASSERT(false && "Reached the unreachable code");
@@ -611,7 +637,12 @@ void PositionIDs::prepare(int64_t past_len) {
             NPUW_ASSERT(m_pyramid_attention && "PyramidAttention reference must not be null");
 
             const auto& context_lengths = m_pyramid_attention->_context_lengths;
-            const int64_t current_seq_length = m_query_size + m_past_length;
+            // For PREFILL, use pyramid_step (KV increment) as the query contribution since
+            // global attention has m_query_size > pyramid_step; the model level is determined
+            // by how many KV tokens fit, not the full query window.
+            const int64_t query_contrib = (m_case == Case::PREFILL) ? static_cast<int64_t>(m_pyramid_step)
+                                                                      : static_cast<int64_t>(m_query_size);
+            const int64_t current_seq_length = query_contrib + m_past_length;
 
             // Find the smallest pyramid model that can handle the current sequence length
             for (std::size_t i = 0; i < context_lengths.size(); ++i) {

@@ -304,12 +304,25 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             }  // if(dynamic)
 
             if (proto_comp_model_desc.pyramid_attention) {
-                // Sanity check first
+                // Multiple pyramid protos with different depths are allowed.
+                // A single selector is used (based on the first encountered proto).
+                // Per-subgraph pyramid_id is capped to the valid range at inference time.
                 if (has_pyramid && pyramid_sub_idx != real_idx) {
-                    OPENVINO_THROW("Only single pyramid attention type is permitted for model");
+                    const auto& first_pyrm =
+                        m_npuw_model->m_compiled_submodels.at(pyramid_sub_idx).pyramid_attention.value();
+                    const auto this_depth =
+                        proto_comp_model_desc.pyramid_attention.value()._compiled_models.size();
+                    if (first_pyrm._compiled_models.size() != this_depth) {
+                        LOG_WARN("Pyramid attention proto " << real_idx << " has depth " << this_depth
+                                 << ", differs from first proto depth "
+                                 << first_pyrm._compiled_models.size()
+                                 << ". pyramid_id will be capped per-subgraph at inference time.");
+                    }
                 }
                 has_pyramid = true;
-                pyramid_sub_idx = real_idx;
+                if (pyramid_sub_idx == static_cast<std::size_t>(-1)) {
+                    pyramid_sub_idx = real_idx;
+                }
                 m_attention_io[i].inputs.resize(proto_comp_model_desc.param_base);
             }  // if(pyramid)
 
@@ -572,7 +585,8 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             // A function call to normal subgraph connection:
             // - Take a tensor from the storage & assign it to the reader
             const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
-            const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
+            const LinkFrom lookup_key{subm_idx_from, port_idx_from};
+            const auto& tensor = m_funcall_result.at(lookup_key);
             subreqs[subm_idx_to]->set_tensor(iport, tensor);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
         } else if (!subm[subm_idx_from].replaced_by && subm[subm_idx_to].replaced_by) {
@@ -626,9 +640,12 @@ void ov::npuw::JustInferRequest::prepare_for_infer() {
         for (auto&& id : m_funcall_heads) {
             auto& comp_model_desc = m_npuw_model->m_compiled_submodels[id];
             if (comp_model_desc.pyramid_attention.has_value()) {
-                m_subrequests[id] = comp_model_desc.pyramid_infer_requests[pyramid_id];
+                const auto capped_id = std::min(
+                    pyramid_id,
+                    comp_model_desc.pyramid_infer_requests.size() - 1);
+                m_subrequests[id] = comp_model_desc.pyramid_infer_requests[capped_id];
                 if (is_pipelined(id)) {
-                    m_funcall_pipeline[id].subrequest = comp_model_desc.pyramid_pipeline_requests[pyramid_id];
+                    m_funcall_pipeline[id].subrequest = comp_model_desc.pyramid_pipeline_requests[capped_id];
                 }
             }
         }
@@ -686,6 +703,22 @@ void ov::npuw::JustInferRequest::start_subrequest(std::size_t idx) {
 void ov::npuw::JustInferRequest::bind_global_parameters(std::size_t idx) {
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
+    auto& proto_desc = m_npuw_model->m_compiled_submodels[real_idx];
+
+    // For pyramid attention subgraphs that are NOT in the pipelined heads list
+    // (i.e. non-pipelined), prepare_for_infer() does NOT update m_subrequests[real_idx]
+    // to the correct pyramid level infer request.  Do it here so that
+    // bind_global_params / bind_pyramid_attention_inputs always operate on the
+    // right (pyramid-level) subrequest.
+    if (m_pyramid_selector && proto_desc.pyramid_attention.has_value() &&
+        !proto_desc.pyramid_infer_requests.empty()) {
+        const auto raw_id = m_pyramid_selector->pyramid_id();
+        const auto capped = std::min(raw_id, proto_desc.pyramid_infer_requests.size() - 1);
+        LOG_DEBUG("[PYRA] bind_global_parameters: idx=" << idx << " real_idx=" << real_idx
+                  << " raw_pyramid_id=" << raw_id << " capped=" << capped
+                  << " num_pyramid=" << proto_desc.pyramid_infer_requests.size());
+        m_subrequests[real_idx] = proto_desc.pyramid_infer_requests[capped];
+    }
 
     // pick which subrequest we actually work on here
     if (now_idx() && real_idx == real(now_idx().value()) && is_pipelined(now_idx().value())) {
@@ -779,9 +812,12 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
                     m_attention_io[idx].inputs.at(i) = i_tensor;
                 }
             } else if (is_pyramid) {
-                // Pyramid attention
-                auto pyramid_id = m_pyramid_selector->pyramid_id();
-                const auto& info = func_desc.pyramid_attention.value()._attention_infos[pyramid_id];
+                // Pyramid attention — cap pyramid_id to valid range for this subgraph
+                const auto& pyrm = func_desc.pyramid_attention.value();
+                const auto pyramid_id = std::min(
+                    m_pyramid_selector->pyramid_id(),
+                    pyrm._attention_infos.size() - 1);
+                const auto& info = pyrm._attention_infos[pyramid_id];
                 if (is_non_param_mask(info, i)) {
                     m_subrequests[real_idx]->set_tensor(iport, i_tensor);
                 } else {
@@ -840,8 +876,34 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
             // HFA case - defer, store in dedicated HFA I/O structure
             m_hfa_io[idx].outputs.at(i) = o_tensor;
         } else if (!is_spatial) {
-            // Non-spatial case - set immediately
-            m_subrequests[real_idx]->set_tensor(oport, o_tensor);
+            if (is_pyramid && m_pyramid_selector) {
+                // Pyramid subgraph: the active sub-model may produce outputs with a
+                // smaller KV sequence length than the prototype. Use a strided view of
+                // the outer tensor so the model writes into the correct slice while
+                // leaving the outer tensor's shape (and any aliased tensors) intact.
+                const auto& pyrm_attn = func_desc.pyramid_attention.value();
+                const auto pyramid_id_cap = std::min(
+                    m_pyramid_selector->pyramid_id(),
+                    pyrm_attn._compiled_models.size() - 1);
+                const auto& pyrm_oport = pyrm_attn._compiled_models[pyramid_id_cap]->outputs()[i];
+                const auto pyrm_out_shape = pyrm_oport.get_partial_shape().to_shape();
+                const auto& o_shape = o_tensor->get_shape();
+                ov::npuw::TensorPtr out_tensor = o_tensor;
+                if (o_shape.size() == pyrm_out_shape.size()) {
+                    for (size_t d = 0; d < o_shape.size(); d++) {
+                        if (pyrm_out_shape[d] < o_shape[d]) {
+                            out_tensor = ov::npuw::util::view(o_tensor,
+                                                              static_cast<uint32_t>(d), 0,
+                                                              pyrm_out_shape[d]);
+                            break;
+                        }
+                    }
+                }
+                m_subrequests[real_idx]->set_tensor(pyrm_oport, out_tensor);
+            } else {
+                // Non-spatial, non-pyramid case - set immediately
+                m_subrequests[real_idx]->set_tensor(oport, o_tensor);
+            }
         } else {
             // Spatial case - defer
             m_spatial_io[real_idx].outputs.at(i) = o_tensor;
@@ -934,15 +996,17 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
     NPUW_ASSERT(comp_model_desc.pyramid_attention.has_value());
 
     auto& r = m_subrequests[real_idx];
-    auto pyramid_id = m_pyramid_selector->pyramid_id();
+    const auto& pyrm_attn = comp_model_desc.pyramid_attention.value();
+    auto pyramid_id = std::min(
+        m_pyramid_selector->pyramid_id(),
+        pyrm_attn._attention_infos.size() - 1);
 
-    const auto& dynamic = comp_model_desc.pyramid_attention.value()._attention_infos[pyramid_id];
+    const auto& dynamic = pyrm_attn._attention_infos[pyramid_id];
     auto mask_iport =
-        comp_model_desc.pyramid_attention.value()._compiled_models[pyramid_id]->inputs()[dynamic.mask_idx];
+        pyrm_attn._compiled_models[pyramid_id]->inputs()[dynamic.mask_idx];
 
     const auto& graph_mask = m_attention_io[idx].inputs.at(dynamic.mask_idx);
     const auto this_case = m_pyramid_selector->this_case();
-    const auto present_len = dynamic.query_size;
 
     // FIXME: get the right dim
     const uint32_t kv_dim = 3;
@@ -970,6 +1034,18 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
     // Pyramid dynamic range identified
     const auto past_len = m_pyramid_selector->past_length();
 
+    // Now set the mask. Here comes very strong chunking & SDPA knowledge again
+    using namespace ov::npuw::runtime;
+
+    // present_len: number of new KV context slots for this pyramid level.
+    // For PREFILL of global attention (SDPADecomposed1), query_size may differ
+    // from the KV step size (context_length - past_len), so we must use the
+    // latter to avoid overflowing the destination mask buffer.
+    const auto present_len =
+        (this_case == pyramid_attention::Selector::Case::PREFILL)
+            ? (dynamic.context_length - past_len)
+            : dynamic.query_size;
+
     // Early return: reuse cached attention mask if available
     if (m_cached_attention_mask) {
         // All sub models are sharing the same attention mask, we can use the cached attention
@@ -978,8 +1054,6 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
         return;
     }
 
-    // Now set the mask. Here comes very strong chunking & SDPA knowledge again
-    using namespace ov::npuw::runtime;
     const auto full_mask_shape = graph_mask->get_shape();
 
     if (this_case == pyramid_attention::Selector::Case::GENERATE) {
