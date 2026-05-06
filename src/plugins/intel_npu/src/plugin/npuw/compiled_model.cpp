@@ -39,6 +39,13 @@
 #include "openvino/util/file_util.hpp"
 #include "transformations/convert_precision.hpp"
 
+#include "openvino/op/ops.hpp"
+#include "openvino/pass/graph_rewrite.hpp"
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/matcher_pass.hpp"
+#include "openvino/pass/pattern/op/optional.hpp"
+#include "openvino/pass/pattern/op/wrap_type.hpp"
+
 namespace {
 void split_properties(const ov::AnyMap& properties,
                       ov::AnyMap& npu_plugin_properties,
@@ -192,6 +199,30 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
     return compiled_model;
 }
 
+namespace opp = ov::pass::pattern;
+
+class EliminateShapeOf : public ov::pass::MatcherPass {
+public:
+    EliminateShapeOf() {
+        auto pattern = opp::wrap_type<ov::op::v3::ShapeOf>(opp::any_input());
+        auto callback = [=](opp::Matcher& m) {
+            auto shape_of = std::dynamic_pointer_cast<ov::op::v3::ShapeOf>(m.get_match_root());
+            if (!shape_of) {
+                return false;
+            }
+            auto input = shape_of->input_value(0);
+            auto shape = input.get_shape();
+            auto element_type = shape_of->output(0).get_element_type();
+            auto shape_const = std::make_shared<ov::op::v0::Constant>(element_type, ov::Shape{shape.size()}, shape);
+            shape_of->output(0).replace(shape_const->output(0));
+            return true;
+        };
+
+        register_matcher(std::make_shared<opp::Matcher>(pattern, "EliminateShapeOf"),
+                    std::move(callback));
+    }
+};
+
 ov::npuw::ICompiledModel::ICompiledModel(const std::shared_ptr<ov::Model>& model,
                                          const std::shared_ptr<const ov::IPlugin>& plugin)
     : ov::ICompiledModel(model, plugin) {}
@@ -210,6 +241,10 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     // And only then do bf16 to f16 transformation
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
     pre_load_transform(model, properties);
+
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<EliminateShapeOf>();
+    rewr.run_on_model(model);
 
     ::intel_npu::registerNPUWOptions(*m_options_desc);
 

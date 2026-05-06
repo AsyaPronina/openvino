@@ -4,8 +4,6 @@
 
 #include "sdpa.hpp"
 
-#include <iostream>
-
 #include "../../logging.hpp"
 #include "../online/group.hpp"     // online::Group
 #include "../online/snapshot.hpp"  // online::Snapshot
@@ -173,25 +171,6 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     register_matcher(std::make_shared<opp::Matcher>(reshape3, "TagSDPADecomposed"), std::move(callback));
 }
 
-/*
-    Decomposed SDPA Pattern:
-        \           /
-            MatMul
-    \       /
-       Add
-        |
-     Softmax
-            \               /
-                  MatMul
-                    |
-                Reshape
-                    |
-                Transpose
-                    |
-                Reshape
-                    |
-*/
-
 SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                                const std::string& isol_tag) {
 
@@ -201,12 +180,8 @@ SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapsho
     auto transpose1 = opp::wrap_type<ov::op::v1::Transpose>({multiply1, opp::any_input()});
     auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), transpose1});
 
-    auto shape_of = opp::wrap_type<ov::op::v3::ShapeOf>({multiply1});
-    auto gather = opp::wrap_type<ov::op::v8::Gather>({shape_of, opp::any_input(), opp::any_input()});
-    auto constant = opp::wrap_type<ov::op::v0::Constant>();
-    auto concat_gather = opp::wrap_type<ov::op::v0::Concat>({ opp::any_input(),  constant,  opp::any_input(), gather});
-    auto reshape_gather = opp::wrap_type<ov::op::v1::Reshape>({concat_gather, opp::any_input()});
-    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, reshape_gather});
+    // auto shape_of = ... (removed: EliminateShapeOf pass folds these nodes before pattern matching)
+    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
 
     auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
 
@@ -237,17 +212,15 @@ SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapsho
             }
         };
 
+        node_to_output.at(concat2).get_node()->input(1).get_source_output().get_node()->set_friendly_name("past_key_values.0.value");
+        node_to_output.at(concat1).get_node()->input(1).get_source_output().get_node()->set_friendly_name("past_key_values.0.key");
+
         isolate_matched(concat1);
         isolate_matched(convert1);
         isolate_matched(multiply1);
         isolate_matched(transpose1);
         isolate_matched(matmul1);
 
-        isolate_matched(shape_of);
-        isolate_matched(gather);
-        isolate_matched(constant);
-        isolate_matched(concat_gather);
-        isolate_matched(reshape_gather);
         isolate_matched(add);
 
         isolate_matched(softmax);
