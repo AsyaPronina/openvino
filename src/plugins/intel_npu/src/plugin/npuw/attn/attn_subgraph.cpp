@@ -615,10 +615,36 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
             bool bind_function_output(ov::npuw::v1::subgraphs::InferContext& ctx,
                                       std::size_t output_idx,
                                       const ov::SoPtr<ov::ITensor>& tensor) override {
-                (void)ctx;
-                (void)output_idx;
-                (void)tensor;
-                return false;
+                if (m_kind != BehaviorKind::Pyramid) {
+                    return false;
+                }
+                const auto& pipeline = get_subgraph_pipeline(ctx, ctx.real_subgraph_idx);
+                const auto* pyramid = ov::npuw::attn::get_compiled_pyramid(pipeline.context);
+                if (!pyramid) {
+                    return false;
+                }
+                auto& state = get_runtime_state(ctx);
+                ensure_pyramid_selector(ctx, state);
+                const auto num_pyramids = pyramid->_compiled_models.size();
+                auto pyramid_id = state.pyramid_selector->pyramid_id();
+                pyramid_id = std::min(pyramid_id, num_pyramids - 1);
+
+                const auto& pyrm_oport = pyramid->_compiled_models[pyramid_id]->outputs()[output_idx];
+                const auto pyrm_out_shape = pyrm_oport.get_partial_shape().to_shape();
+                const auto& o_shape = tensor->get_shape();
+
+                ov::SoPtr<ov::ITensor> out_tensor = tensor;
+                if (o_shape.size() == pyrm_out_shape.size()) {
+                    for (size_t d = 0; d < o_shape.size(); d++) {
+                        if (pyrm_out_shape[d] < o_shape[d]) {
+                            out_tensor =
+                                ov::npuw::util::view(tensor, static_cast<uint32_t>(d), 0, pyrm_out_shape[d]);
+                            break;
+                        }
+                    }
+                }
+                ctx.target_request->set_tensor(pyrm_oport, out_tensor);
+                return true;
             }
 
             void prologue(ov::npuw::v1::subgraphs::InferContext& ctx) override {
