@@ -910,47 +910,23 @@ void Partitioner::identifySubgraphs() {
 std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType utype) {
     func_pipeline_type = utype;
 
-    // [FOLD only] Determine the canonical (prototype) output count for each group.
-    // The first call site seen for each _repeated_id defines the boundary; call
-    // sites with a different count are assigned to a new sub-group below so that
-    // all downstream passes (propagateConvertsOut, sanityCheck, …) always see
-    // internally-consistent groups with a uniform output boundary.
-    std::map<std::string, std::size_t> canonical_count;
-    if (func_pipeline_type == FunctionPipelineType::FOLD) {
-        for (auto&& part_sg : P.subgraphs) {
-            if (!part_sg._repeated_id.empty())
-                canonical_count.emplace(part_sg._repeated_id, part_sg._results.size());
-        }
-    }
-
-    // Assign each call site to the correct function group.
+    // Collect all groups of function call(s) and process them in groups
     std::map<std::string, int> idx;
-    std::map<std::string, std::map<std::size_t, std::string>> sub_group_ids;  // orig_id -> {n_out -> sub_id}
-    std::map<std::string, int> split_counter;
     for (auto&& part_sg : P.subgraphs) {
         if (!part_sg._repeated_id.empty()) {
-            const auto& orig_id = part_sg._repeated_id;
-            auto pfix = "__" + std::to_string(idx[orig_id]++);
-            std::string fcid;
-            if (func_pipeline_type == FunctionPipelineType::FOLD &&
-                part_sg._results.size() != canonical_count.at(orig_id)) {
-                // Output count differs from the prototype: assign to a sub-group,
-                // creating it on first encounter, and fix _repeated_id immediately.
-                auto& sub_id = sub_group_ids[orig_id][part_sg._results.size()];
-                if (sub_id.empty())
-                    sub_id = orig_id + "_S" + std::to_string(split_counter[orig_id]++);
-                fcid = sub_id;
-                part_sg._repeated_id = fcid;
-            } else {
-                fcid = func_pipeline_type == FunctionPipelineType::FOLD ? orig_id : orig_id + pfix;
-            }
+            auto pfix = "__" + std::to_string(idx[part_sg._repeated_id]++);
+            const auto& fcid = func_pipeline_type == FunctionPipelineType::FOLD
+                                   ? part_sg._repeated_id          // with folding, functions of the
+                                                                   // same group have the same id
+                                   : part_sg._repeated_id + pfix;  // with CWAI (which is not checked here)
+                                                                   // every function gets its own id
             auto& u = all_functions[fcid];
             u.refs.push_back(std::ref(part_sg));
             u.mdls.push_back(
                 std::make_shared<ov::Model>(part_sg._results,
                                             part_sg._sinks,
                                             part_sg._parameters,
-                                            model->get_friendly_name() + "_" + orig_id + pfix));
+                                            model->get_friendly_name() + "_" + part_sg._repeated_id + pfix));
         }
     }
 
@@ -965,57 +941,23 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
         return functions;
     }
 
-    // For any groups that had call sites split off, partition the ens.repeated banks
-    // between the original group and each sub-group in a single pass, then register
-    // the sub-group blocks.  The layer_to_prototype loop below handles all groups
-    // uniformly, so no separate rebase step is needed.
-    for (auto& [orig_id, count_to_sub] : sub_group_ids) {
-        auto& orig_block = ens.repeated.at(orig_id);
-
-        // Build name-to-sub_id maps by iterating the already-created sub-group models.
-        std::unordered_map<std::string, std::string> layer_to_sub;
-        std::unordered_map<std::string, std::string> const_to_sub;
-        for (auto& [count, sub_id] : count_to_sub) {
-            LOG_WARN("initFunctionPipeline: sub-group " << sub_id << " split from " << orig_id
-                     << " (" << count << " output(s) vs " << canonical_count.at(orig_id) << " in proto)");
-            for (auto& mdl : all_functions.at(sub_id).mdls) {
-                for (auto&& node : mdl->get_ordered_ops()) {
-                    if (ov::op::util::is_constant(node))
-                        const_to_sub[get_unique_name(node)] = sub_id;
-                    else if (!ov::op::util::is_parameter(node) && !ov::op::util::is_output(node))
-                        layer_to_sub[node->get_friendly_name()] = sub_id;
-                }
-            }
+    // For FOLD mode, ensure the call site with the most results is the prototype
+    // (placed first in refs/mdls). This guarantees layer_to_prototype covers all
+    // possible output writers and proto_results in matchResults has entries for
+    // every output variant. Call sites with fewer outputs use a subset.
+    for (auto&& p : all_functions) {
+        auto& fp = p.second;
+        auto max_it = std::max_element(
+            fp.refs.begin(),
+            fp.refs.end(),
+            [](const auto& a, const auto& b) {
+                return a.get()._results.size() < b.get()._results.size();
+            });
+        if (max_it != fp.refs.begin()) {
+            const auto max_idx = std::distance(fp.refs.begin(), max_it);
+            std::swap(fp.refs[0], fp.refs[max_idx]);
+            std::swap(fp.mdls[0], fp.mdls[max_idx]);
         }
-
-        // Partition each bank: entries belonging to a sub-group go into sub_blocks;
-        // the rest remain in the original group.  Both the split and the prune of
-        // the original happen in the same single pass.
-        std::map<std::string, ov::npuw::RepeatedBlock> sub_blocks;
-        auto partition = [&](ov::npuw::RepeatedBlock::MatchedBank& bank,
-                             const std::unordered_map<std::string, std::string>& name_to_sub,
-                             ov::npuw::RepeatedBlock::MatchedBank ov::npuw::RepeatedBlock::* dst) {
-            ov::npuw::RepeatedBlock::MatchedBank remain;
-            for (auto& entry : bank) {
-                ov::npuw::RepeatedBlock::MatchedLayers kept;
-                std::map<std::string, ov::npuw::RepeatedBlock::MatchedLayers> split;
-                for (auto& name : entry) {
-                    auto it = name_to_sub.find(name);
-                    if (it != name_to_sub.end()) split[it->second].insert(name);
-                    else kept.insert(name);
-                }
-                if (!kept.empty()) remain.push_back(std::move(kept));
-                for (auto& [sub_id, layers] : split)
-                    (sub_blocks[sub_id].*dst).push_back(std::move(layers));
-            }
-            bank = std::move(remain);
-        };
-        partition(orig_block.matches, layer_to_sub, &ov::npuw::RepeatedBlock::matches);
-        partition(orig_block.consts,  const_to_sub, &ov::npuw::RepeatedBlock::consts);
-        partition(orig_block.scalars, const_to_sub, &ov::npuw::RepeatedBlock::scalars);
-
-        for (auto& [sub_id, rb] : sub_blocks)
-            ens.repeated[sub_id] = std::move(rb);
     }
 
     // Then, populate a list of functions and the early layer_to_prototype mapping.
@@ -1264,7 +1206,7 @@ void Partitioner::propagateScalars(const std::string& func_name) {
     // See explanation in propagateConverts().
     // The propagation procedure is generic, but the matching isn't.
     auto& scalar_bank = ens.repeated.at(func_name).scalars;
-    auto& model_group = all_functions.at(func_name).mdls;
+    // auto& model_group = all_functions.at(func_name).mdls;
 
     auto match_fcn = [&](const std::shared_ptr<ov::Node>& node_ptr) -> bool {
         const auto& this_layer_name =
@@ -1282,80 +1224,9 @@ void Partitioner::propagateScalars(const std::string& func_name) {
     };
     propagate(func_name, match_fcn, scalar_bank);
 
-    // Post-processing: fix scalar banks whose size is between 2 and N-1
-    // where all constant values are identical.
-    //
-    // This can happen when consecutive call-site models share an op boundary such
-    // that some call sites have ALL readers of a scalar constant internal (→ full
-    // proto_reader_set → land in bank A), while adjacent call sites have their
-    // readers split across two models (→ partial proto_reader_set → size-1 banks).
-    // The result is a bank A with fewer entries than refs.size() — which fails
-    // sanityCheck even though all values are the same.
-    //
-    // When the values are indeed identical, add synthetic dup_scalars entries so
-    // that validate_scalars' (size + dups == N) condition is satisfied.  The bank
-    // entries themselves remain unchanged (required for the "all consts registered"
-    // coverage check that follows scalar validation).  saveRepeatedConstants's
-    // check_and_mark handles size>1 with identical values correctly by keeping
-    // them as a shared constant in the function body.
-    {
-        using CT = ov::op::v0::Constant;
-        const size_t N = all_functions.at(func_name).refs.size();
-
-        if (N > 1) {
-            // Build a unique-name → const-node cache for this function group
-            std::unordered_map<std::string, std::shared_ptr<CT>> const_cache;
-            for (auto&& m : model_group) {
-                for (auto&& n : m->get_ordered_ops()) {
-                    if (ov::is_type<CT>(n)) {
-                        const auto& uname = get_unique_name(n);
-                        if (const_cache.find(uname) == const_cache.end())
-                            const_cache[uname] = std::static_pointer_cast<CT>(n);
-                    }
-                }
-            }
-
-            auto values_equal = [](const std::shared_ptr<CT>& a, const std::shared_ptr<CT>& b) -> bool {
-                if (a->output(0).get_shape() != b->output(0).get_shape()) return false;
-                if (a->output(0).get_element_type() != b->output(0).get_element_type()) return false;
-                const size_t byte_size = a->get_byte_size();
-                return std::memcmp(a->get_data_ptr(), b->get_data_ptr(), byte_size) == 0;
-            };
-
-            for (auto& bank : scalar_bank) {
-                if (bank.size() < 2 || bank.size() >= N) continue;
-
-                // Only consider tiny-shape constants (same criterion as saveRepeatedConstants)
-                const auto& proto_uname = *bank.begin();
-                auto proto_it = const_cache.find(proto_uname);
-                if (proto_it == const_cache.end()) continue;
-                const auto& proto_shape = proto_it->second->output(0).get_shape();
-                if (!ov::npuw::partitioning::traits::is_tiny_shape(proto_shape)) continue;
-
-                // Check that every entry has the same value
-                bool all_identical = true;
-                for (auto it = std::next(bank.begin()); it != bank.end(); ++it) {
-                    auto c_it = const_cache.find(*it);
-                    if (c_it == const_cache.end() || !values_equal(proto_it->second, c_it->second)) {
-                        all_identical = false;
-                        break;
-                    }
-                }
-                if (!all_identical) continue;
-
-                // All values are identical: add synthetic dup_scalars entries so
-                // that validate_scalars' (size + dups == N) condition is satisfied.
-                // Bank entries are kept intact so the "all consts registered"
-                // coverage check in sanityCheck still passes.
-                const size_t synthetic_dups = N - bank.size();
-                dup_scalars[{func_name, proto_uname}] += synthetic_dups;
-                LOG_WARN("propagateScalars: scalar bank for " << func_name << " has " << bank.size()
-                         << " entries (expected " << N << "); values identical, adding "
-                         << synthetic_dups << " synthetic dup entries");
-            }
-        }
-    }
-
+    // // Post-processing: fix scalar banks whose size is between 2 and N-1
+    // // where all constant values are identical.
+    // //
     LOG_VERB("Done");
 }
 
@@ -1833,38 +1704,7 @@ void Partitioner::matchParameters(const std::string& func_name) {
                     }
                 }
                 LOG_DEBUG("Find orig parameter for " << node);
-
-                // Try exact match first.  When a call-site model covers only a
-                // partial slice of its prototype (readers of a parameter are split
-                // across model boundaries), pkey will be a strict subset of the
-                // proto parameter's full pkey.  In that case fall back to
-                // containment matching: find the proto parameter whose pkey either
-                // contains pkey or is contained by pkey.  Because every parameter
-                // has a unique reader-set identity this is unambiguous in practice.
-                // Guard: an empty pkey means all of this parameter's readers are
-                // external to the current call-site model.  That is structurally
-                // impossible for a well-formed repeated group (the prototype was
-                // built from the first call site which must contain the readers).
-                // An empty key is a subset of every set, so the fallback below
-                // would silently match a random proto parameter — catch it early.
-                OPENVINO_ASSERT(!pkey.empty(),
-                    "matchParameters: parameter has no internal readers in call-site model - "
-                    "this indicates a malformed repeated function group");
-                auto it = proto_parameters.find(pkey);
-                if (it == proto_parameters.end()) {
-                    for (it = proto_parameters.begin(); it != proto_parameters.end(); ++it) {
-                        const auto& ppkey = it->first;
-                        bool call_subset = std::includes(ppkey.begin(), ppkey.end(),
-                                                         pkey.begin(), pkey.end());
-                        bool proto_subset = std::includes(pkey.begin(), pkey.end(),
-                                                          ppkey.begin(), ppkey.end());
-                        if (call_subset || proto_subset) break;
-                    }
-                    if (it == proto_parameters.end()) {
-                        OPENVINO_THROW("matchParameters: no prototype parameter matches call-site pkey");
-                    }
-                }
-                auto& orig_param = it->second;
+                auto& orig_param = proto_parameters.at(pkey);
                 auto this_param = std::dynamic_pointer_cast<PPtr::element_type>(node);
                 func.param_call_to_proto[SubgParam(subg_ref, this_param)] = orig_param;
             }
@@ -1902,17 +1742,15 @@ void Partitioner::matchResults(const std::string& func_name) {
         }
     }
 
-    // Now walk all call sites and map their results to the prototype.
-    // splitByOutputCount() guarantees every call site has the same output
-    // count as the prototype, so every rkey is guaranteed to resolve.
+    // Now walk all submodels and match parameters with the same key
+    // (yes, including the first one)
     for (std::size_t call_idx = 0; call_idx < model_group.size(); ++call_idx) {
         auto call = model_group[call_idx];
         auto subg_ref = func.refs[call_idx];
         for (auto&& node : call->get_ordered_ops()) {
             if (ov::op::util::is_output(node)) {
                 auto&& port = node->input(0).get_source_output();
-                const auto& writer_name = port.get_node()->get_friendly_name();
-                RKey rkey = {layer_to_prototype.at(writer_name), port.get_index()};
+                RKey rkey = {layer_to_prototype.at(port.get_node()->get_friendly_name()), port.get_index()};
                 auto& orig_result = proto_results.at(rkey);
                 auto this_result = std::dynamic_pointer_cast<RPtr::element_type>(node);
                 func.result_call_to_proto[SubgResult(subg_ref, this_result)] = orig_result;
