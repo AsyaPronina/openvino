@@ -186,7 +186,23 @@ SDPADecomposed1::SDPADecomposed1(const std::shared_ptr<ov::npuw::online::Snapsho
     auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), transpose1});
 
     // auto shape_of = ... (removed: EliminateShapeOf pass folds these nodes before pattern matching)
-    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
+
+    auto consumes_global_mask = [](const ov::Output<ov::Node>& output) -> bool {
+        if (auto node_ptr = output.get_node_shared_ptr()) {
+            if (auto reshape = node_ptr->get_input_node_shared_ptr(1); reshape && ov::is_type<ov::op::v1::Reshape>(reshape)) {
+                if (auto tile = reshape->get_input_node_shared_ptr(0); tile && ov::is_type<ov::op::v0::Tile>(tile)) {
+                    if (auto convert = tile->get_input_node_shared_ptr(0); convert && ov::is_type<ov::op::v0::Convert>(convert)) {
+                        if (auto mask_param = convert->get_input_node_shared_ptr(0); mask_param && ov::is_type<ov::op::v0::Parameter>(mask_param)) {
+                            return mask_param->get_friendly_name().find("attention_mask_global") != std::string::npos;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()}, consumes_global_mask);
 
     auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
 
