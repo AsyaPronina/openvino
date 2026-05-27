@@ -347,6 +347,103 @@ public:
     }
 };
 
+class SharedVCache : public ov::pass::MatcherPass {
+public:
+    SharedVCache() {
+        auto concat1 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input()});
+        auto convert1 = opp::wrap_type<ov::op::v0::Convert>({concat1});
+        auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({convert1, opp::any_input()});
+        auto transpose1 = opp::wrap_type<ov::op::v1::Transpose>({multiply1, opp::any_input()});
+        auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), transpose1});
+
+        // auto shape_of = ... (removed: EliminateShapeOf pass folds these nodes before pattern matching)
+        auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
+
+        auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
+
+        auto concat2 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input()});
+        auto convert2 = opp::wrap_type<ov::op::v0::Convert>({concat2});
+        auto multiply2 = opp::wrap_type<ov::op::v1::Multiply>({convert2, opp::any_input()});
+
+        auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, multiply2});
+        auto reshape1 = opp::wrap_type<ov::op::v1::Reshape>({matmul2, opp::any_input()});
+        auto transpose = opp::wrap_type<ov::op::v1::Transpose>({reshape1, opp::any_input()});
+        auto reshape2 = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
+
+       // Note: Use [=] to make sure the above objects stay alive in the callback
+        auto callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& node_to_output = m.get_pattern_value_map();
+
+            auto multiply2_node = std::dynamic_pointer_cast<ov::op::v1::Multiply>(node_to_output.at(multiply2).get_node_shared_ptr());
+            auto matmul2_node = std::dynamic_pointer_cast<ov::op::v0::MatMul>(node_to_output.at(matmul2).get_node_shared_ptr());
+
+            auto ml_node_target_inputs = multiply2_node->output(0).get_target_inputs();
+            if (ml_node_target_inputs.size() <= 1) {
+                // multiply2 has only one consumer (matmul2 in this pattern) -- nothing to unshare.
+                return false;
+            }
+
+            // Get the original nodes
+            auto concat2_node = std::dynamic_pointer_cast<ov::op::v0::Concat>(node_to_output.at(concat2).get_node_shared_ptr());
+            auto convert2_node = std::dynamic_pointer_cast<ov::op::v0::Convert>(node_to_output.at(convert2).get_node_shared_ptr());
+
+            // Extract inputs to concat2
+            auto concat2_inputs = concat2_node->inputs();
+            auto multiply2_inputs = multiply2_node->inputs();
+            // For each extra consumer of multiply2 (beyond the matmul2 already in the pattern),
+            // create a duplicate concat->convert->multiply chain and redirect that consumer's
+            // V input to the new chain.  Each consumer keeps its own Q (its own softmax) --
+            // only the shared V-cache side is duplicated.
+            for (auto& target_input : ml_node_target_inputs) {
+                // Skip the matmul2 that is already part of this matched pattern.
+                if (target_input.get_node() == matmul2_node.get()) {
+                    continue;
+                }
+
+                if (!dynamic_cast<ov::op::v0::MatMul*>(target_input.get_node())) {
+                    continue;
+                }
+
+                // Clone concat2 with same inputs
+                auto new_concat = std::make_shared<ov::op::v0::Concat>(
+                    ov::OutputVector{concat2_inputs[0].get_source_output(), concat2_inputs[1].get_source_output()},
+                    concat2_node->get_axis());
+
+                // Clone convert2
+                auto new_convert = std::make_shared<ov::op::v0::Convert>(new_concat,
+                                                                          convert2_node->get_convert_element_type());
+
+                // Clone multiply2.
+                // IMPORTANT: clone the scale constant (not reuse it) so each new chain
+                // owns its own constant node.  Sharing the same constant across multiple
+                // call-site subgraph models confuses the partitioner's propagateWeights
+                // bank-assignment, which expects exactly one constant per call site.
+                auto scale_source = multiply2_inputs[1].get_source_output();
+                auto scale_const_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+                    scale_source.get_node_shared_ptr());
+                ov::Output<ov::Node> new_scale_output;
+                if (scale_const_node) {
+                    auto new_scale = std::make_shared<ov::op::v0::Constant>(*scale_const_node);
+                    new_scale_output = new_scale->output(0);
+                } else {
+                    // Not a plain constant (e.g. a model parameter) — safe to reuse.
+                    new_scale_output = scale_source;
+                }
+                auto new_multiply = std::make_shared<ov::op::v1::Multiply>(new_convert, new_scale_output);
+
+                // Redirect this consumer's V input from the shared multiply2 to the new chain.
+                // The consumer keeps its existing Q input (its own softmax) unchanged.
+                target_input.replace_source_output(new_multiply->output(0));
+            }
+
+            return true;
+        };
+
+        register_matcher(std::make_shared<opp::Matcher>(reshape2, "SharedVCache"),
+                    std::move(callback));
+    }
+};
+
 ov::npuw::ICompiledModel::ICompiledModel(const std::shared_ptr<ov::Model>& model,
                                          const std::shared_ptr<const ov::IPlugin>& plugin)
     : ov::ICompiledModel(model, plugin) {}
@@ -372,9 +469,12 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
     pre_load_transform(model, properties);
 
-    ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<EliminateShapeOf>();
-    rewr.run_on_model(model);
+    if (properties.count("NPUW_ATTN") && properties.at("NPUW_ATTN").as<std::string>() != "STATIC") {
+        ov::pass::GraphRewrite rewr;
+        rewr.add_matcher<EliminateShapeOf>();
+        rewr.add_matcher<SharedVCache>();
+        rewr.run_on_model(model);
+    }
 
     ::intel_npu::registerNPUWOptions(*m_options_desc);
 

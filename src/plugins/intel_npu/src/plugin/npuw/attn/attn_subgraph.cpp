@@ -615,6 +615,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
             bool bind_function_output(ov::npuw::v1::subgraphs::InferContext& ctx,
                                       std::size_t output_idx,
                                       const ov::SoPtr<ov::ITensor>& tensor) override {
+                return false;
                 if (m_kind != BehaviorKind::Pyramid) {
                     return false;
                 }
@@ -775,8 +776,9 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         }
                         if (this_case == pyramid_attention::Selector::Case::PREFILL) {
                             const auto present_len = dynamic.context_length - past_len;
-                            copy_mask_segment(past_len, full_mask_shape[ATTN_KV_DIM] - present_len, present_len);
-                            copy_mask_segment(0, 0, past_len);
+                            // copy_mask_segment(past_len, full_mask_shape[ATTN_KV_DIM] - present_len, present_len);
+                            // copy_mask_segment(past_len, past_len, present_len);
+                            copy_mask_segment(0, 0, present_len);
                             state.cached_attention_mask = dst;
                             return;
                         }
