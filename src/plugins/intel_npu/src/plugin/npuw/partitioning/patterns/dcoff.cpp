@@ -4,6 +4,8 @@
 
 #include "dcoff.hpp"
 
+#include <iostream>
+
 #include "../../lazy_tensor.hpp"
 #include "../../logging.hpp"
 #include "../../util.hpp"
@@ -147,6 +149,9 @@ void apply_remap(Subgraph& fcall, const ClosureRemap& m) {
                 // Note: It's important here to manually detach LazyTensor since it's not going to be present in the
                 // bank - thus left in memory
                 if (weight_to_unpack) {
+                    std::cout << "[NPUW-MEMTRACK] LT action=DETACHED(dcoff-weight) hash="
+                              << fcall._lazy_closure[i].get_hash() << " " << fcall._lazy_closure[i].debug_str()
+                              << std::endl;
                     fcall._lazy_closure[i].detach();
                 }
             }
@@ -163,9 +168,15 @@ void apply_remap(Subgraph& fcall, const ClosureRemap& m) {
         // Note: It's important here to manually detach LazyTensor since it's not going to be present in the bank - thus
         // left in memory
         if (scale_iter != m.scale_remap.end()) {
+            std::cout << "[NPUW-MEMTRACK] LT action=DETACHED(dcoff-scale) hash="
+                      << fcall._lazy_closure[scale_iter->second].get_hash() << " "
+                      << fcall._lazy_closure[scale_iter->second].debug_str() << std::endl;
             fcall._lazy_closure[scale_iter->second].detach();
         }
         if (zerop_iter != m.zerop_remap.end()) {
+            std::cout << "[NPUW-MEMTRACK] LT action=DETACHED(dcoff-zerop) hash="
+                      << fcall._lazy_closure[zerop_iter->second].get_hash() << " "
+                      << fcall._lazy_closure[zerop_iter->second].debug_str() << std::endl;
             fcall._lazy_closure[zerop_iter->second].detach();
         }
     }

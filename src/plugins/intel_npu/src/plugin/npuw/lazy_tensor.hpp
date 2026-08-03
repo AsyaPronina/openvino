@@ -66,6 +66,8 @@ public:
     std::size_t get_hash() const;
     std::vector<Transform> get_transformations() const;
     void detach();
+    // Debugging helper: human-readable identity (constant name + source pointer)
+    std::string debug_str() const;
 
     struct Meta {
         ov::Shape shape;
@@ -100,6 +102,8 @@ public:
     LazyTensor::Meta eval_meta() const;
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
     void detach();
+    // Debugging helper: human-readable identity (constant name + source pointer)
+    std::string debug_str() const;
     void serialize(ov::npuw::orc::Stream& stream);
 
 private:

@@ -4,6 +4,7 @@
 
 #include "lazy_tensor.hpp"
 
+#include <sstream>
 #include <tuple>
 #include <type_traits>
 #include <variant>
@@ -143,6 +144,13 @@ void Const::detach() {
     m_node.reset();
     m_read_from_bin = ov::Tensor();
     m_mmaped_weights.reset();
+}
+
+std::string Const::debug_str() const {
+    std::stringstream ss;
+    ss << "const='" << (m_node ? m_node->get_friendly_name() : std::string("<node-detached>")) << "'"
+       << " src_ptr=" << m_cached_ptr << " offset=" << m_offset;
+    return ss.str();
 }
 
 std::size_t Concat::hash() const {
@@ -381,6 +389,7 @@ struct LazyTensorImpl {
     void get_transformations(std::vector<LazyTensor::Transform>& vec) const;
 
     void detach();
+    std::string debug_str() const;
 
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
     void serialize(ov::npuw::orc::Stream& stream);
@@ -660,6 +669,32 @@ void LazyTensorImpl::detach() {
                m_transform);
 }
 
+std::string LazyTensorImpl::debug_str() const {
+    return std::visit(overloaded{
+                          [](const op::Const& op) {
+                              return op.debug_str();
+                          },
+                          [](const op::Concat& op) {
+                              return std::string("concat[") +
+                                     (op.tensors.empty() ? std::string("<empty>") : op.tensors.front().debug_str()) +
+                                     ", ...]";
+                          },
+                          [](const op::Unpack& op) {
+                              return std::string("unpack[") + op.w.debug_str() + "]";
+                          },
+                          [](const op::Permute& op) {
+                              return std::string("permute[") + op.tensor.debug_str() + "]";
+                          },
+                          [](const op::Convert& op) {
+                              return std::string("convert[") + op.tensor.debug_str() + "]";
+                          },
+                          [](const op::Gather& op) {
+                              return std::string("gather[") + op.w.debug_str() + "]";
+                          },
+                      },
+                      m_transform);
+}
+
 LazyTensor::LazyTensor(const std::shared_ptr<ov::op::v0::Constant>& const_ptr)
     : m_impl(std::make_shared<LazyTensorImpl>(op::Const(const_ptr))) {}
 LazyTensor::LazyTensor(const std::vector<LazyTensor>& to_concat, const std::size_t axis)
@@ -746,6 +781,13 @@ void LazyTensor::detach() {
     if (m_impl) {
         m_impl->detach();
     }
+}
+
+std::string LazyTensor::debug_str() const {
+    if (!m_impl) {
+        return "<empty-lazy-tensor>";
+    }
+    return m_impl->debug_str();
 }
 
 std::size_t LazyTensor::Hash::operator()(const LazyTensor& lt) const {

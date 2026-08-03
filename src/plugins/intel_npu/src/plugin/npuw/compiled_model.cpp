@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <string>
@@ -1541,6 +1542,9 @@ void ov::npuw::CompiledModel::detach_memory() {
 
         if (can_clear) {
             LOG_INFO("No fallback expected - clear the OV model for Subgraph[" << idx << "]");
+            std::cout << "[NPUW-MEMTRACK] IR action=DETACHED subgraph=" << idx << " name='"
+                      << proto_comp_model_desc.model->get_friendly_name() << "'"
+                      << " ptr=" << proto_comp_model_desc.model.get() << std::endl;
             proto_comp_model_desc.model.reset();
         } else {
             LOG_INFO("Runtime fallback still possible - keeping OV model for Subgraph[" << idx << "]");

@@ -4,6 +4,9 @@
 
 #include "weights_bank.hpp"
 
+#include <iostream>
+#include <sstream>
+
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
 #include "serialization.hpp"
@@ -62,6 +65,8 @@ int64_t Bank::registerLT(const LazyTensor& tensor, const std::string& device) {
         return uid;
     } else {
         // Already registered - can be safely detach the incoming tensor
+        std::cout << "[NPUW-MEMTRACK] LT action=DETACHED(duplicate) hash=" << tensor.get_hash() << " "
+                  << tensor.debug_str() << std::endl;
         const_cast<LazyTensor&>(tensor).detach();
     }
 
@@ -125,6 +130,14 @@ void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTen
         device_bank.storage.at(uid).tensor = ov::Tensor(t.get_element_type(), t.get_shape());
         // Get ownership of the weights, might be a mmaped object during import
         t.copy_to(device_bank.storage.at(uid).tensor);
+        {
+            std::stringstream ss;
+            ss << "[NPUW-MEMTRACK] LT action=ALLOCATED hash=" << lt.get_hash() << " " << lt.debug_str()
+               << " alloc_ptr=" << device_bank.storage.at(uid).tensor.data() << " uid=" << uid << " device=CPU\n";
+            ss << "[NPUW-MEMTRACK] LT action=DETACHED  hash=" << lt.get_hash() << " " << lt.debug_str() << " uid=" << uid
+               << "\n";
+            std::cout << ss.str() << std::flush;
+        }
         const_cast<LazyTensor&>(lt).detach();
     });
 }
@@ -174,6 +187,16 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
         auto transformed = stored_tensor.lt.eval();
         transformed.copy_to(allocated.allocated_tensor);
         stored_tensor.tensor = std::move(allocated.allocated_tensor);
+
+        {
+            std::stringstream ss;
+            ss << "[NPUW-MEMTRACK] LT action=ALLOCATED hash=" << stored_tensor.lt.get_hash() << " "
+               << stored_tensor.lt.debug_str() << " alloc_ptr=" << stored_tensor.tensor.data()
+               << " uid=" << allocated.uid << " device=" << device << "\n";
+            ss << "[NPUW-MEMTRACK] LT action=DETACHED  hash=" << stored_tensor.lt.get_hash() << " "
+               << stored_tensor.lt.debug_str() << " uid=" << allocated.uid << "\n";
+            std::cout << ss.str() << std::flush;
+        }
 
         // Detach the evaluated LazyTensor from its memory here - when it is 100%
         // not needed anymore (transformations, if any, and copies are done)
