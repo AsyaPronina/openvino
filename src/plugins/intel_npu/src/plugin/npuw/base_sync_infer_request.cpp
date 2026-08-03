@@ -333,6 +333,17 @@ void ov::npuw::IBaseInferRequest::init_gio() {
 }
 
 void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request) {
+    // [NPUW-MEMTRACK] One-time build banner: confirms THIS instrumented binary is the one running.
+    // __DATE__/__TIME__ are baked at compile time, so a fresh build prints a fresh timestamp.
+    {
+        static const bool _npuw_build_banner = [] {
+            std::cout << "[NPUW-MEMTRACK] BUILD " << __DATE__ << " " << __TIME__
+                      << " (unpack instrumentation active)" << std::endl;
+            return true;
+        }();
+        (void)_npuw_build_banner;
+    }
+
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
 
     NPUW_ASSERT(comp_model_desc.replaced_by);
@@ -378,6 +389,13 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         }
     }  // for(closure)
 
+    // [NPUW-MEMTRACK] Always-on summary for this subgraph's closure binding. If unpack_required=0,
+    // NO high-precision unpack happens here, which rules out the host-side unpack path as the
+    // source of the extra memory. Seeing this line at all also proves inference reached bind time.
+    std::cout << "[NPUW-MEMTRACK] unpack_closure subgraph=" << idx << " real_idx=" << real_idx
+              << " closures=" << desc_closure.size() << " unpack_required=" << closure_unpack_required.size()
+              << " copy_required=" << closure_copy_required.size() << std::endl;
+
     // m_ms_unpack += ov::npuw::perf::ms_to_run([&](){
     ov::parallel_for(closure_copy_required.size(), [&](std::size_t j) {
         auto cidx = closure_copy_required[j];
@@ -385,6 +403,22 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         const auto closure_param_id = comp_model_desc.param_base + cidx;
         auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
         auto clparam = request->get_tensor(iport);
+
+        // [NPUW-MEMTRACK] The bank weight is COPIED into a per-subrequest device input buffer
+        // (needs_copy path: NPU device + non-remote closure). copy_bytes ~ full weight size means an
+        // extra full-weight allocation per subrequest that did not exist when it was a baked constant.
+        {
+            std::string ltname;
+            if (cidx < comp_model_desc.lazy_closure.size()) {
+                ltname = comp_model_desc.lazy_closure[cidx].debug_str();
+            }
+            std::ostringstream oss;
+            oss << "[NPUW-MEMTRACK] COPY subgraph=" << idx << " cidx=" << cidx
+                << " closure_type=" << closure.get_element_type() << " port_type=" << iport.get_element_type()
+                << " copy_bytes=" << (clparam ? clparam->get_byte_size() : 0) << " " << ltname << "\n";
+            std::cout << oss.str() << std::flush;
+        }
+
         ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
     });
     // }); // ms_to_run

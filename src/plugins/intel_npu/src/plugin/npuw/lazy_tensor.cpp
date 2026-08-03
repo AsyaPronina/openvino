@@ -4,6 +4,7 @@
 
 #include "lazy_tensor.hpp"
 
+#include <iostream>
 #include <sstream>
 #include <tuple>
 #include <type_traits>
@@ -59,6 +60,15 @@ bool Const::operator==(const Const& other) const {
 }
 
 ov::Tensor Const::eval() const {
+    // [NPUW-MEMTRACK] In-tensor allocation event: this constant copy is being materialized (the
+    // survivor that ends up in the bank). Group by src_ptr: exactly ONE CONST-ALLOC per constant.
+    {
+        std::stringstream ss;
+        ss << "[NPUW-MEMTRACK] CONST-ALLOC hash=" << hash() << " const='"
+           << (m_node ? m_node->get_friendly_name() : std::string("<node-detached>")) << "'"
+           << " src_ptr=" << m_cached_ptr << " offset=" << m_offset << "\n";
+        std::cout << ss.str() << std::flush;
+    }
     if (m_node) {
         return ov::npuw::util::copy_tensor_from_const(m_node);
     }
@@ -141,6 +151,16 @@ void Const::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
 }
 
 void Const::detach() {
+    // [NPUW-MEMTRACK] In-tensor detach event: this constant copy releases its source. Group by
+    // src_ptr: every duplicate copy plus the survivor's source detach here; only the single bank
+    // tensor (see LT action=ALLOCATED uid=...) survives.
+    {
+        std::stringstream ss;
+        ss << "[NPUW-MEMTRACK] CONST-DETACH hash=" << hash() << " const='"
+           << (m_node ? m_node->get_friendly_name() : std::string("<node-detached>")) << "'"
+           << " src_ptr=" << m_cached_ptr << " offset=" << m_offset << "\n";
+        std::cout << ss.str() << std::flush;
+    }
     m_node.reset();
     m_read_from_bin = ov::Tensor();
     m_mmaped_weights.reset();
