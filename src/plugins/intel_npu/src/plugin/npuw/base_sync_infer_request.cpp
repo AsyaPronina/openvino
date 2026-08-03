@@ -5,6 +5,7 @@
 
 #include "base_sync_infer_request.hpp"
 
+#include <iostream>
 #include <sstream>
 
 #include "attn/attn_subgraph.hpp"
@@ -400,6 +401,22 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         const auto closure_param_id = comp_model_desc.param_base + cidx;
         auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
         auto clparam = request->get_tensor(iport);
+
+        // [NPUW-MEMTRACK] A quantized bank weight (u4/u8) is being expanded at bind time into a
+        // full-size tensor of the port's element type (e.g. f16). unpacked_bytes >> closure_bytes
+        // means the whole weight is materialized in high precision (the tail-vocab blow-up).
+        {
+            std::string ltname;
+            if (cidx < comp_model_desc.lazy_closure.size()) {
+                ltname = comp_model_desc.lazy_closure[cidx].debug_str();
+            }
+            std::cout << "[NPUW-MEMTRACK] UNPACK subgraph=" << idx << " cidx=" << cidx
+                      << " closure_type=" << closure.get_element_type()
+                      << " port_type=" << iport.get_element_type()
+                      << " closure_bytes=" << closure.get_byte_size()
+                      << " unpacked_bytes=" << (clparam ? clparam->get_byte_size() : 0) << " " << ltname
+                      << std::endl;
+        }
 
         if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx] && comp_model_desc.zerops[cidx]) {
             // Unpacking this weight requires scaling with zero points...
