@@ -8,6 +8,9 @@
 #    include <cstdlib>
 #endif
 
+#include <atomic>
+#include <iostream>
+
 #include "intel_npu/utils/logger/logger.hpp"
 #include "intel_npu/utils/zero/zero_init.hpp"
 #include "intel_npu/utils/zero/zero_mem.hpp"
@@ -162,6 +165,19 @@ std::shared_ptr<ZeroMem> allocate_memory(const std::shared_ptr<ZeroInitStructsHo
                                          const size_t bytes,
                                          const size_t alignment,
                                          const bool is_input) {
+    // [NPUW-MEMTRACK] Single choke point for ALL Level-Zero allocations. On integrated NPU this is
+    // zeMemAllocHost -> shared system RAM, so L0-total is the driver's total device-visible memory.
+    // A second vocab-sized L0-ALLOC here (beyond the one bank copy) is the "weights on device too".
+    static std::atomic<std::size_t> s_total{0};
+    static std::atomic<std::size_t> s_count{0};
+    const std::size_t running_total = (s_total += bytes);
+    const std::size_t running_count = ++s_count;
+    if (bytes >= (static_cast<std::size_t>(1) << 20)) {  // only report >= 1 MiB to cut noise
+        std::cout << "[NPUW-MEMTRACK] L0-ALLOC bytes=" << bytes << " (~" << (bytes >> 20)
+                  << " MiB) is_input=" << is_input << " L0-total=" << running_total << " (~"
+                  << (running_total >> 20) << " MiB) allocs=" << running_count << "\n"
+                  << std::flush;
+    }
     return ZeroMemPoolManager::allocate_memory(init_structs, bytes, alignment, is_input);
 }
 

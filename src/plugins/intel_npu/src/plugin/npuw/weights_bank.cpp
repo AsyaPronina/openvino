@@ -115,6 +115,23 @@ void Bank::evaluate_and_allocate() {
             evaluate_and_allocate_on_device(device_bank, to_process, device_for_alloc);
         }
     }  // for (m_device_banks)
+
+    // [NPUW-MEMTRACK] Per-device total of ALL weights the bank holds (sum of every stored tensor).
+    // NOTE: the non-CPU path uses create_host_tensor(), so "device=NPU" bytes are L0 HOST memory
+    // (host RAM registered with the NPU context), NOT device-local DDR. Compare this total before vs
+    // after the PR: if it is unchanged, the bank is not the source of the extra memory.
+    for (const auto& db : m_device_banks) {
+        std::size_t total = 0, n = 0;
+        for (const auto& el : db.second.storage) {
+            if (el.second.tensor) {
+                total += el.second.tensor.get_byte_size();
+                ++n;
+            }
+        }
+        std::cout << "[NPUW-MEMTRACK] BANK-TOTAL device=" << db.first << " tensors=" << n << " bytes=" << total
+                  << " (~" << (total >> 20) << " MiB)\n"
+                  << std::flush;
+    }
 }
 
 void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTensor>& to_process) {
@@ -133,6 +150,7 @@ void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTen
         {
             std::stringstream ss;
             ss << "[NPUW-MEMTRACK] LT action=ALLOCATED hash=" << lt.get_hash() << " " << lt.debug_str()
+               << " byte_size=" << device_bank.storage.at(uid).tensor.get_byte_size()
                << " alloc_ptr=" << device_bank.storage.at(uid).tensor.data() << " uid=" << uid << " device=CPU\n";
             ss << "[NPUW-MEMTRACK] LT action=DETACHED  hash=" << lt.get_hash() << " " << lt.debug_str() << " uid=" << uid
                << "\n";
@@ -191,8 +209,9 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
         {
             std::stringstream ss;
             ss << "[NPUW-MEMTRACK] LT action=ALLOCATED hash=" << stored_tensor.lt.get_hash() << " "
-               << stored_tensor.lt.debug_str() << " alloc_ptr=" << stored_tensor.tensor.data()
-               << " uid=" << allocated.uid << " device=" << device << "\n";
+               << stored_tensor.lt.debug_str() << " byte_size=" << stored_tensor.tensor.get_byte_size()
+               << " alloc_ptr=" << stored_tensor.tensor.data() << " uid=" << allocated.uid << " device=" << device
+               << "\n";
             ss << "[NPUW-MEMTRACK] LT action=DETACHED  hash=" << stored_tensor.lt.get_hash() << " "
                << stored_tensor.lt.debug_str() << " uid=" << allocated.uid << "\n";
             std::cout << ss.str() << std::flush;
