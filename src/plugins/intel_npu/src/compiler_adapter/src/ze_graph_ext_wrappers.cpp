@@ -4,6 +4,10 @@
 
 #include "ze_graph_ext_wrappers.hpp"
 
+#include <unistd.h>
+
+#include <fstream>
+#include <iostream>
 #include <string_view>
 
 #include "intel_npu/prefix.hpp"
@@ -18,6 +22,18 @@
 
 namespace {
 using namespace intel_npu;
+
+// [NPUW-MEMTRACK] Resident set size (MiB) from /proc/self/statm. Used to measure the device memory
+// the NPU driver allocates for a compiled graph inside pfnGraphInitialize (blob + scratch), which
+// bypasses the Level-Zero tensor pool and is therefore invisible to the L0-ALLOC counter.
+inline long npuw_rss_mib() {
+    std::ifstream f("/proc/self/statm");
+    long total_pages = 0, resident_pages = 0;
+    if (f >> total_pages >> resident_pages) {
+        return (resident_pages * sysconf(_SC_PAGESIZE)) >> 20;
+    }
+    return -1;
+}
 /**
  * @brief Extracts the I/O metadata from Level Zero specific structures and converts them into OpenVINO specific
  * ones.
@@ -256,6 +272,7 @@ void ZeGraphExtWrappers::setGraphArgumentValueWithStrides(const GraphDescriptor&
 }
 
 void ZeGraphExtWrappers::initializeGraph(const GraphDescriptor& graphDescriptor) const {
+    const long npuw_rss_before = npuw_rss_mib();
     if (_graphExtVersion < ZE_MAKE_VERSION(1, 8)) {
         _logger.debug("Use initializeGraphThroughCommandList for ext version smaller than 1.8");
         initializeGraphThroughCommandList(graphDescriptor._handle);
@@ -275,6 +292,10 @@ void ZeGraphExtWrappers::initializeGraph(const GraphDescriptor& graphDescriptor)
             initializeGraphThroughCommandList(graphDescriptor._handle);
         }
     }
+    const long npuw_rss_after = npuw_rss_mib();
+    std::cout << "[NPUW-MEMTRACK] GRAPH-INIT handle=" << graphDescriptor._handle << " rss_before=" << npuw_rss_before
+              << " MiB rss_after=" << npuw_rss_after << " MiB delta=" << (npuw_rss_after - npuw_rss_before) << " MiB\n"
+              << std::flush;
 }
 
 void ZeGraphExtWrappers::initializeGraphThroughCommandList(ze_graph_handle_t graphHandle) const {

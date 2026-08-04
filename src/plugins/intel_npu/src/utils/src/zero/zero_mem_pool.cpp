@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 
 #include "intel_npu/utils/logger/logger.hpp"
 #include "intel_npu/utils/zero/zero_init.hpp"
@@ -18,6 +20,18 @@
 
 namespace intel_npu {
 namespace zero_mem {
+
+// [NPUW-MEMTRACK] Live/peak accounting for pool allocations. Guarded by g_track_mutex. The map is
+// keyed by the ZeroMem* pointer recorded in allocate_memory; delete_pool_entry looks it up to
+// subtract on free. Imports never enter the map, so their frees are correctly ignored.
+namespace {
+std::mutex g_track_mutex;
+std::unordered_map<const void*, std::size_t> g_track_alloc_bytes;
+std::size_t g_track_live = 0;
+std::size_t g_track_peak = 0;
+std::size_t g_track_cumulative = 0;
+std::size_t g_track_count = 0;
+}  // namespace
 
 class ZeroMemPoolManager final {
 public:
@@ -154,6 +168,23 @@ private:
     }
 
     static void delete_pool_entry(const std::shared_ptr<ZeroInitStructsHolder>& init_structs, ZeroMem* zero_memory) {
+        // [NPUW-MEMTRACK] Subtract freed pool allocations from the live counter. Imported entries are
+        // not in the map, so they are correctly ignored here.
+        {
+            std::lock_guard<std::mutex> lk(g_track_mutex);
+            auto it = g_track_alloc_bytes.find(zero_memory);
+            if (it != g_track_alloc_bytes.end()) {
+                const std::size_t freed = it->second;
+                g_track_live -= freed;
+                g_track_alloc_bytes.erase(it);
+                if (freed >= (static_cast<std::size_t>(1) << 20)) {
+                    std::cout << "[NPUW-MEMTRACK] L0-FREE  bytes=" << freed << " (~" << (freed >> 20)
+                              << " MiB) L0-live=" << g_track_live << " (~" << (g_track_live >> 20)
+                              << " MiB) L0-peak=" << g_track_peak << " (~" << (g_track_peak >> 20) << " MiB)\n"
+                              << std::flush;
+                }
+            }
+        }
         auto& zero_mem_pool = init_structs->getZeroMemPool().mem_pool;
         std::unique_lock<std::mutex> deleter_lock(init_structs->getZeroMemPool().mem_pool_deleter_mutex);
         zero_mem_pool.erase(zero_memory->id());
@@ -165,20 +196,30 @@ std::shared_ptr<ZeroMem> allocate_memory(const std::shared_ptr<ZeroInitStructsHo
                                          const size_t bytes,
                                          const size_t alignment,
                                          const bool is_input) {
-    // [NPUW-MEMTRACK] Single choke point for ALL Level-Zero allocations. On integrated NPU this is
-    // zeMemAllocHost -> shared system RAM, so L0-total is the driver's total device-visible memory.
-    // A second vocab-sized L0-ALLOC here (beyond the one bank copy) is the "weights on device too".
-    static std::atomic<std::size_t> s_total{0};
-    static std::atomic<std::size_t> s_count{0};
-    const std::size_t running_total = (s_total += bytes);
-    const std::size_t running_count = ++s_count;
-    if (bytes >= (static_cast<std::size_t>(1) << 20)) {  // only report >= 1 MiB to cut noise
-        std::cout << "[NPUW-MEMTRACK] L0-ALLOC bytes=" << bytes << " (~" << (bytes >> 20)
-                  << " MiB) is_input=" << is_input << " L0-total=" << running_total << " (~"
-                  << (running_total >> 20) << " MiB) allocs=" << running_count << "\n"
-                  << std::flush;
+    // [NPUW-MEMTRACK] Single choke point for ALL Level-Zero pool allocations. On integrated NPU this
+    // is zeMemAllocHost -> shared system RAM. We track LIVE (alloc - free) and PEAK so the reported
+    // numbers are true resident L0 memory, directly comparable to the weights-bank size. L0-total is
+    // the cumulative sum (never decremented) kept only for reference.
+    auto mem = ZeroMemPoolManager::allocate_memory(init_structs, bytes, alignment, is_input);
+    {
+        std::lock_guard<std::mutex> lk(g_track_mutex);
+        g_track_alloc_bytes[mem.get()] = bytes;
+        g_track_live += bytes;
+        g_track_cumulative += bytes;
+        ++g_track_count;
+        if (g_track_live > g_track_peak) {
+            g_track_peak = g_track_live;
+        }
+        if (bytes >= (static_cast<std::size_t>(1) << 20)) {  // only report >= 1 MiB to cut noise
+            std::cout << "[NPUW-MEMTRACK] L0-ALLOC bytes=" << bytes << " (~" << (bytes >> 20)
+                      << " MiB) is_input=" << is_input << " L0-live=" << g_track_live << " (~"
+                      << (g_track_live >> 20) << " MiB) L0-peak=" << g_track_peak << " (~" << (g_track_peak >> 20)
+                      << " MiB) L0-total=" << g_track_cumulative << " (~" << (g_track_cumulative >> 20)
+                      << " MiB) allocs=" << g_track_count << "\n"
+                      << std::flush;
+        }
     }
-    return ZeroMemPoolManager::allocate_memory(init_structs, bytes, alignment, is_input);
+    return mem;
 }
 
 std::shared_ptr<ZeroMem> import_shared_memory(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
