@@ -4,9 +4,23 @@
 
 #include "ze_graph_ext_wrappers.hpp"
 
-#include <unistd.h>
+#ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+// psapi.h must be included after windows.h
+#    include <psapi.h>
+#    pragma comment(lib, "psapi.lib")
+#else
+#    include <unistd.h>
 
-#include <fstream>
+#    include <fstream>
+#endif
+
 #include <iostream>
 #include <string_view>
 
@@ -23,16 +37,25 @@
 namespace {
 using namespace intel_npu;
 
-// [NPUW-MEMTRACK] Resident set size (MiB) from /proc/self/statm. Used to measure the device memory
-// the NPU driver allocates for a compiled graph inside pfnGraphInitialize (blob + scratch), which
-// bypasses the Level-Zero tensor pool and is therefore invisible to the L0-ALLOC counter.
+// [NPUW-MEMTRACK] Resident set size (MiB). Used to measure the device memory the NPU driver
+// allocates for a compiled graph inside pfnGraphInitialize (blob + scratch), which bypasses the
+// Level-Zero tensor pool and is therefore invisible to the L0-ALLOC counter.
+// Windows: GetProcessMemoryInfo().WorkingSetSize; Linux: /proc/self/statm resident pages.
 inline long npuw_rss_mib() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, static_cast<DWORD>(sizeof(pmc)))) {
+        return static_cast<long>(pmc.WorkingSetSize >> 20);
+    }
+    return -1;
+#else
     std::ifstream f("/proc/self/statm");
     long total_pages = 0, resident_pages = 0;
     if (f >> total_pages >> resident_pages) {
-        return (resident_pages * sysconf(_SC_PAGESIZE)) >> 20;
+        return static_cast<long>((resident_pages * sysconf(_SC_PAGESIZE)) >> 20);
     }
     return -1;
+#endif
 }
 /**
  * @brief Extracts the I/O metadata from Level Zero specific structures and converts them into OpenVINO specific
