@@ -4,6 +4,8 @@
 
 #include "zero_infer_request.hpp"
 
+#include <iostream>
+
 #include "intel_npu/common/itt.hpp"
 #include "intel_npu/config/options.hpp"
 #include "intel_npu/prefix.hpp"
@@ -521,6 +523,13 @@ void ZeroInferRequest::sync_zero_tensor_with_graph(const ZeroInferRequest::Found
             // context.
             levelZeroTensor = std::make_shared<ZeroTensor>(_initStructs, tensor);
             updateCommandListArg = true;
+            // [NPUW-MEMTRACK] Zero-copy reuse succeeded: no private input buffer was allocated for this port.
+            if (tensor->get_byte_size() >= (static_cast<std::size_t>(1) << 20)) {
+                std::cout << "[NPUW-MEMTRACK] SET-TENSOR-REUSE port_idx=" << foundPort.idx
+                          << " is_input=" << foundPort.is_input() << " bytes=" << tensor->get_byte_size() << " (~"
+                          << (tensor->get_byte_size() >> 20) << " MiB)\n"
+                          << std::flush;
+            }
         } catch (const ZeroMemException& exception) {
             _logger.debug("sync_zero_tensor_with_graph - exception caught while trying to create a "
                           "Level Zero tensor from the user tensor: %s",
@@ -534,6 +543,12 @@ void ZeroInferRequest::sync_zero_tensor_with_graph(const ZeroInferRequest::Found
 
                 levelZeroTensor = allocate_tensor(foundPort.idx, foundPort.is_input(), _graph->get_batch_size());
                 updateCommandListArg = true;
+                // [NPUW-MEMTRACK] Import failed -> a PRIVATE backing input buffer was allocated for this port.
+                // This is where a shared bank weight (e.g. the LM-head vocab) gets duplicated as is_input=1.
+                std::cout << "[NPUW-MEMTRACK] SET-TENSOR-ALLOC port_idx=" << foundPort.idx
+                          << " is_input=" << foundPort.is_input() << " bytes=" << tensor->get_byte_size() << " (~"
+                          << (tensor->get_byte_size() >> 20) << " MiB) reason='" << exception.what() << "'\n"
+                          << std::flush;
             } else {
                 _logger.debug("sync_zero_tensor_with_graph - reusing the level zero tensor since it "
                               "is not shared with the user");
